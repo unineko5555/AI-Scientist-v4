@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"fixture-thread"}
+{"type":"item.completed","item":{"id":"fixture-notice","type":"error","message":"Code Mode is unavailable because code-mode host is disabled. Code mode will fail closed; enable `features.code_mode_host` and install `codex-code-mode-host`."}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"fixture-answer","type":"agent_message","text":"fixture-live-nonce"}}
+{"type":"turn.completed","usage":{"input_tokens":8717,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":16,"reasoning_output_tokens":0}}

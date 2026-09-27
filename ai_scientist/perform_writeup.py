@@ -13,7 +13,12 @@ from ai_scientist.llm import (
     get_response_from_llm,
     extract_json_between_markers,
     create_client,
-    AVAILABLE_LLMS,
+)
+from ai_scientist.inference import (
+    InferenceError,
+    add_inference_arguments,
+    configure_from_args,
+    shutdown_inference,
 )
 
 from ai_scientist.tools.semantic_scholar import search_for_papers
@@ -236,7 +241,7 @@ This JSON will be automatically parsed, so ensure the format is precise."""
 
     try:
         text, msg_history = get_response_from_llm(
-            msg=citation_first_prompt_template.format(
+            prompt=citation_first_prompt_template.format(
                 current_round=current_round + 1,
                 total_rounds=total_rounds,
                 Idea=idea_text,
@@ -259,6 +264,8 @@ This JSON will be automatically parsed, so ensure the format is precise."""
         assert json_output is not None, "Failed to extract JSON from LLM output"
         query = json_output["Query"]
         papers = search_for_papers(query)
+    except InferenceError:
+        raise
     except Exception:
         print("EXCEPTION in get_citation_addition (initial search):")
         print(traceback.format_exc())
@@ -284,7 +291,7 @@ This JSON will be automatically parsed, so ensure the format is precise."""
 
     try:
         text, msg_history = get_response_from_llm(
-            msg=citation_second_prompt_template.format(
+            prompt=citation_second_prompt_template.format(
                 papers=papers_str,
                 current_round=current_round + 1,
                 total_rounds=total_rounds,
@@ -329,6 +336,8 @@ This JSON will be automatically parsed, so ensure the format is precise."""
         else:
             return None, False
 
+    except InferenceError:
+        raise
     except Exception:
         print("EXCEPTION in get_citation_addition (selecting papers):")
         print(traceback.format_exc())
@@ -460,6 +469,7 @@ def perform_writeup(
     big_model="o1-2024-12-17",
     n_writeup_reflections=3,
     page_limit=8,
+    citations_text=None,
 ):
     compile_attempt = 0
     base_pdf_file = osp.join(base_folder, f"{osp.basename(base_folder)}")
@@ -539,9 +549,19 @@ def perform_writeup(
             compile_latex(latex_folder, base_pdf_file + ".pdf")
             return osp.exists(base_pdf_file + ".pdf")
 
-        # Run small model for citation additions
-        client, client_model = create_client(small_model)
-        for round_idx in range(num_cite_rounds):
+        # The launcher gathers citations once for either writeup format.  Keep
+        # the original in-writer citation path for standalone callers.
+        supplied_citations = citations_text is not None
+        if citations_text:
+            pattern_end = r"\end{filecontents}"
+            writeup_text = writeup_text.replace(
+                pattern_end, f"\n{citations_text}{pattern_end}", 1
+            )
+            with open(writeup_file, "w") as f:
+                f.write(writeup_text)
+        if not supplied_citations and num_cite_rounds > 0:
+            client, client_model = create_client(small_model, role="citation")
+        for round_idx in range(0 if supplied_citations else num_cite_rounds):
             with open(writeup_file, "r") as f:
                 writeup_text = f.read()
             try:
@@ -582,6 +602,8 @@ def perform_writeup(
                             )
                             with open(writeup_file, "w") as fo:
                                 fo.write(revised)
+            except InferenceError:
+                raise
             except Exception:
                 print("EXCEPTION in perform_writeup (citation round):")
                 print(traceback.format_exc())
@@ -589,7 +611,7 @@ def perform_writeup(
 
         # Generate VLM-based descriptions but do not overwrite plot_names
         try:
-            vlm_client, vlm_model = create_vlm_client(small_model)
+            vlm_client, vlm_model = create_vlm_client(small_model, role="writing_vision")
             desc_map = {}
             for pf in plot_names:
                 ppath = osp.join(figures_dir, pf)
@@ -613,6 +635,8 @@ def perform_writeup(
                 desc_text = desc_map.get(fname, "No description found")
                 plot_descriptions_list.append(f"{fname}: {desc_text}")
             plot_descriptions_str = "\n".join(plot_descriptions_list)
+        except InferenceError:
+            raise
         except Exception:
             print("EXCEPTION in VLM figure description generation:")
             print(traceback.format_exc())
@@ -622,7 +646,7 @@ def perform_writeup(
         big_model_system_message = writeup_system_message_template.format(
             page_limit=page_limit
         )
-        big_client, big_client_model = create_client(big_model)
+        big_client, big_client_model = create_client(big_model, role="writing")
         with open(writeup_file, "r") as f:
             writeup_text = f.read()
 
@@ -636,7 +660,7 @@ def perform_writeup(
         )
 
         response, msg_history = get_response_from_llm(
-            msg=combined_prompt,
+            prompt=combined_prompt,
             client=big_client,
             model=big_client_model,
             system_message=big_model_system_message,
@@ -707,7 +731,7 @@ If you believe you are done, simply say: "I am done".
 """
 
             reflection_response, msg_history = get_response_from_llm(
-                msg=reflection_prompt,
+                prompt=reflection_prompt,
                 client=big_client,
                 model=big_client_model,
                 system_message=big_model_system_message,
@@ -752,15 +776,21 @@ If you believe you are done, simply say: "I am done".
                 print(f"No valid LaTeX code block found in reflection step {i+1}.")
                 break
 
-        return osp.exists(base_pdf_file + f"_{compile_attempt-1}.pdf")
+        # A zero-reflection run is still a complete writeup, and the final
+        # artifact must contain the current LaTeX rather than an earlier round.
+        final_pdf = base_pdf_file + "_final.pdf"
+        compile_latex(latex_folder, final_pdf)
+        return osp.exists(final_pdf)
 
+    except InferenceError:
+        raise
     except Exception:
         print("EXCEPTION in perform_writeup:")
         print(traceback.format_exc())
         return False
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Perform writeup for a project")
     parser.add_argument("--folder", type=str, help="Project folder", required=True)
     parser.add_argument("--no-writing", action="store_true", help="Only generate")
@@ -769,14 +799,12 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
-        choices=AVAILABLE_LLMS,
         help="Model to use for citation collection (small model).",
     )
     parser.add_argument(
         "--big-model",
         type=str,
         default="o1-2024-12-17",
-        choices=AVAILABLE_LLMS,
         help="Model to use for final writeup (big model).",
     )
     parser.add_argument(
@@ -791,9 +819,18 @@ if __name__ == "__main__":
         default=8,
         help="Target page limit for the main paper (excluding references, impact statement, etc.)",
     )
-    args = parser.parse_args()
+    add_inference_arguments(parser)
+    parser.set_defaults(
+        _inference_model_roles={
+            "model": ["citation", "writing_vision"],
+            "big_model": ["writing"],
+        }
+    )
+    args = parser.parse_args(argv)
 
     try:
+        runtime = configure_from_args(args, artifact_dir=args.folder, argv=argv)
+        runtime.preflight()
         success = perform_writeup(
             base_folder=args.folder,
             no_writing=args.no_writing,
@@ -805,6 +842,16 @@ if __name__ == "__main__":
         )
         if not success:
             print("Writeup process did not complete successfully.")
+        return 0 if success else 1
+    except InferenceError:
+        raise
     except Exception:
         print("EXCEPTION in main:")
         print(traceback.format_exc())
+        return 1
+    finally:
+        shutdown_inference()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -9,9 +9,14 @@ import sys
 
 sys.path.append(osp.join(osp.dirname(__file__), ".."))
 from ai_scientist.llm import (
-    AVAILABLE_LLMS,
     create_client,
     get_response_from_llm,
+)
+from ai_scientist.inference import (
+    InferenceError,
+    add_inference_arguments,
+    configure_from_args,
+    shutdown_inference,
 )
 
 from ai_scientist.tools.semantic_scholar import SemanticScholarSearchTool
@@ -232,6 +237,14 @@ def generate_temp_free_idea(
 
                             # Append the idea to the archive
                             idea_str_archive.append(json.dumps(idea))
+                            # Keep completed proposals if a later CLI call hits a
+                            # subscription limit or authentication failure.
+                            with open(idea_fname, "w") as f:
+                                json.dump(
+                                    [json.loads(item) for item in idea_str_archive],
+                                    f,
+                                    indent=4,
+                                )
                             print(f"Proposal finalized: {idea}")
                             idea_finalized = True
                             break
@@ -252,6 +265,8 @@ def generate_temp_free_idea(
             if idea_finalized:
                 continue  # Move to the next idea
 
+        except InferenceError:
+            raise
         except Exception as e:
             print("Failed to generate proposal:")
             traceback.print_exc()
@@ -266,7 +281,7 @@ def generate_temp_free_idea(
     return ideas
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Generate AI scientist proposals - template free"
     )
@@ -274,7 +289,6 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default="gpt-4o-2024-05-13",
-        choices=AVAILABLE_LLMS,
         help="Model to use for AI Scientist.",
     )
     parser.add_argument(
@@ -295,25 +309,38 @@ if __name__ == "__main__":
         default=5,
         help="Number of reflection rounds per proposal.",
     )
-    args = parser.parse_args()
+    add_inference_arguments(parser)
+    parser.set_defaults(_inference_model_roles={"model": ["ideation"]})
+    args = parser.parse_args(argv)
 
-    # Create the LLM client
-    client, client_model = create_client(args.model)
+    try:
+        runtime = configure_from_args(
+            args,
+            artifact_dir=osp.dirname(osp.abspath(args.workshop_file)),
+            argv=argv,
+        )
+        runtime.preflight()
+        client, client_model = create_client(args.model, role="ideation")
 
-    with open(args.workshop_file, "r") as f:
-        workshop_description = f.read()
-    print(f"Using workshop description from {args.workshop_file} for idea generation.")
-    print(f"Workshop description:\n{workshop_description}")
+        with open(args.workshop_file, "r") as f:
+            workshop_description = f.read()
+        print(f"Using workshop description from {args.workshop_file} for idea generation.")
+        print(f"Workshop description:\n{workshop_description}")
 
-    # Create output filename by replacing .md extension with .json
-    idea_fname = args.workshop_file.replace(".md", ".json")
-    print("Starting idea generation for", idea_fname)
-    ideas = generate_temp_free_idea(
-        idea_fname=idea_fname,
-        client=client,
-        model=client_model,
-        workshop_description=workshop_description,
-        max_num_generations=args.max_num_generations,
-        num_reflections=args.num_reflections,
-    )
-    print(f"{args.workshop_file} generated {len(ideas)} ideas.")
+        idea_fname = osp.splitext(args.workshop_file)[0] + ".json"
+        print("Starting idea generation for", idea_fname)
+        ideas = generate_temp_free_idea(
+            idea_fname=idea_fname,
+            client=client,
+            model=client_model,
+            workshop_description=workshop_description,
+            max_num_generations=args.max_num_generations,
+            num_reflections=args.num_reflections,
+        )
+        print(f"{args.workshop_file} generated {len(ideas)} ideas.")
+    finally:
+        shutdown_inference()
+
+
+if __name__ == "__main__":
+    main()

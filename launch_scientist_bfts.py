@@ -2,12 +2,19 @@ import os.path as osp
 import json
 import argparse
 import shutil
-import torch
 import os
 import re
 import sys
 from datetime import datetime
 from ai_scientist.llm import create_client
+from ai_scientist.vlm import create_client as create_vlm_client
+from ai_scientist.inference import (
+    InferenceError,
+    add_inference_arguments,
+    configure_from_args,
+    shutdown_inference,
+)
+from ai_scientist.inference.errors import ConfigurationError
 
 from contextlib import contextmanager
 from ai_scientist.treesearch.perform_experiments_bfts_with_agentmanager import (
@@ -39,7 +46,7 @@ def save_token_tracker(idea_dir):
         json.dump(token_tracker.get_interactions(), f)
 
 
-def parse_arguments():
+def parse_arguments(argv=None):
     parser = argparse.ArgumentParser(description="Run AI scientist experiments")
     parser.add_argument(
         "--writeup-type",
@@ -128,17 +135,55 @@ def parse_arguments():
         action="store_true",
         help="If set, skip the review process",
     )
-    return parser.parse_args()
+    add_inference_arguments(parser)
+    parser.set_defaults(
+        _inference_model_roles={
+            "model_agg_plots": ["aggregation"],
+            "model_writeup": ["writing"],
+            "model_citation": ["citation"],
+            "model_writeup_small": ["writing_vision"],
+            "model_review": ["review_text", "review_vision"],
+        }
+    )
+    return parser.parse_args(argv)
+
+
+def load_experiment_inference_defaults(config_path):
+    """Read the same YAML used by the experiment before selecting transport.
+
+    Omitting the inference section preserves legacy behavior. Invalid settings
+    must never silently erase a YAML subscription-only policy.
+    """
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ConfigurationError("Reading experiment configuration requires PyYAML") from exc
+    try:
+        with open(config_path, "r", encoding="utf-8") as stream:
+            experiment_config = yaml.safe_load(stream)
+    except (OSError, yaml.YAMLError) as exc:
+        raise ConfigurationError("Cannot read experiment configuration for inference defaults") from exc
+    if not isinstance(experiment_config, dict):
+        raise ConfigurationError("Experiment configuration must be a YAML mapping")
+    inference_defaults = experiment_config.get("inference", {})
+    if not isinstance(inference_defaults, dict):
+        raise ConfigurationError("Experiment inference configuration must be a mapping")
+    return inference_defaults
 
 
 def get_available_gpus(gpu_ids=None):
     if gpu_ids is not None:
         return [int(gpu_id) for gpu_id in gpu_ids.split(",")]
+    # Help and inference configuration diagnostics do not require the research
+    # execution stack. Actual GPU discovery/training still requires PyTorch.
+    import torch
     return list(range(torch.cuda.device_count()))
 
 
 def find_pdf_path_for_review(idea_dir):
-    pdf_files = [f for f in os.listdir(idea_dir) if f.endswith(".pdf")]
+    pdf_files = sorted(f for f in os.listdir(idea_dir) if f.endswith(".pdf"))
+    if not pdf_files:
+        return None
     reflection_pdfs = [f for f in pdf_files if "reflection" in f]
     if reflection_pdfs:
         # First check if there's a final version
@@ -161,7 +206,20 @@ def find_pdf_path_for_review(idea_dir):
             else:
                 # Fall back to the first reflection PDF if no numbers found
                 pdf_path = osp.join(idea_dir, reflection_pdfs[0])
-    return pdf_path
+        return pdf_path
+
+    # Normal writeups use numbered/final PDFs, not reflection filenames.
+    final_pdfs = [f for f in pdf_files if "final" in f.lower()]
+    if final_pdfs:
+        return osp.join(idea_dir, final_pdfs[-1])
+    numbered_pdfs = []
+    for filename in pdf_files:
+        match = re.search(r"_(\d+)\.pdf$", filename)
+        if match:
+            numbered_pdfs.append((int(match.group(1)), filename))
+    if numbered_pdfs:
+        return osp.join(idea_dir, max(numbered_pdfs)[1])
+    return osp.join(idea_dir, pdf_files[-1])
 
 
 @contextmanager
@@ -179,26 +237,8 @@ def redirect_stdout_stderr_to_file(log_file_path):
         log.close()
 
 
-if __name__ == "__main__":
-    args = parse_arguments()
-    os.environ["AI_SCIENTIST_ROOT"] = os.path.dirname(os.path.abspath(__file__))
-    print(f"Set AI_SCIENTIST_ROOT to {os.environ['AI_SCIENTIST_ROOT']}")
-
-    # Check available GPUs and adjust parallel processes if necessary
-    available_gpus = get_available_gpus()
-    print(f"Using GPUs: {available_gpus}")
-
-    with open(args.load_ideas, "r") as f:
-        ideas = json.load(f)
-        print(f"Loaded {len(ideas)} pregenerated ideas from {args.load_ideas}")
-
-    idea = ideas[args.idea_idx]
-
-    date = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    idea_dir = f"experiments/{date}_{idea['Name']}_attempt_{args.attempt_id}"
-    print(f"Results will be saved in {idea_dir}")
-    os.makedirs(idea_dir, exist_ok=True)
-
+def run_pipeline(args, ideas, idea_dir):
+    """Run the original V2 workflow; CLI backends change only inference."""
     # Convert idea json to markdown file
     idea_path_md = osp.join(idea_dir, "idea.md")
 
@@ -253,6 +293,7 @@ if __name__ == "__main__":
         idea_path_json,
     )
 
+    write_run_status(idea_dir, "running", stage="experiments")
     perform_experiments_bfts(idea_config_path)
     experiment_results_dir = osp.join(idea_dir, "logs/0-run/experiment_results")
     if os.path.exists(experiment_results_dir):
@@ -262,20 +303,25 @@ if __name__ == "__main__":
             dirs_exist_ok=True,
         )
 
+    write_run_status(idea_dir, "running", stage="plot_aggregation")
     aggregate_plots(base_folder=idea_dir, model=args.model_agg_plots)
 
-    shutil.rmtree(osp.join(idea_dir, "experiment_results"))
+    copied_results = osp.join(idea_dir, "experiment_results")
+    if osp.isdir(copied_results):
+        shutil.rmtree(copied_results)
 
     save_token_tracker(idea_dir)
 
     if not args.skip_writeup:
         writeup_success = False
+        write_run_status(idea_dir, "running", stage="citations")
         citations_text = gather_citations(
             idea_dir,
             num_cite_rounds=args.num_cite_rounds,
             small_model=args.model_citation,
-        )
+        ) or ""
         for attempt in range(args.writeup_retries):
+            write_run_status(idea_dir, "running", stage="writeup")
             print(f"Writeup attempt {attempt+1} of {args.writeup_retries}")
             if args.writeup_type == "normal":
                 writeup_success = perform_writeup(
@@ -297,33 +343,45 @@ if __name__ == "__main__":
                 break
 
         if not writeup_success:
-            print("Writeup process did not complete successfully after all retries.")
+            raise RuntimeError(
+                "Writeup process did not complete successfully after all retries."
+            )
 
     save_token_tracker(idea_dir)
 
     if not args.skip_review and not args.skip_writeup:
+        write_run_status(idea_dir, "running", stage="review")
         # Perform paper review if the paper exists
         pdf_path = find_pdf_path_for_review(idea_dir)
-        if os.path.exists(pdf_path):
+        if pdf_path is not None and os.path.exists(pdf_path):
             print("Paper found at: ", pdf_path)
             paper_content = load_paper(pdf_path)
-            client, client_model = create_client(args.model_review)
+            client, client_model = create_client(args.model_review, role="review_text")
             review_text = perform_review(paper_content, client_model, client)
-            review_img_cap_ref = perform_imgs_cap_ref_review(
-                client, client_model, pdf_path
-            )
             with open(osp.join(idea_dir, "review_text.txt"), "w") as f:
                 f.write(json.dumps(review_text, indent=4))
+            # Text and vision can select different CLI models/providers.
+            vlm_client, vlm_model = create_vlm_client(
+                args.model_review, role="review_vision"
+            )
+            review_img_cap_ref = perform_imgs_cap_ref_review(
+                vlm_client, vlm_model, pdf_path
+            )
             with open(osp.join(idea_dir, "review_img_cap_ref.json"), "w") as f:
                 json.dump(review_img_cap_ref, f, indent=4)
             print("Paper review completed.")
+        else:
+            raise RuntimeError("No completed paper PDF is available for review.")
 
-    print("Start cleaning up processes")
-    # Kill all mp and torch processes associated with this experiment
+    # Include the final text and image reviews in the legacy usage snapshot.
+    save_token_tracker(idea_dir)
+
+
+def cleanup_owned_processes():
+    """Clean up descendants of this run, never unrelated system processes."""
     import psutil
     import signal
 
-    # Get the current process and all its children
     current_process = psutil.Process()
     children = current_process.children(recursive=True)
 
@@ -335,7 +393,7 @@ if __name__ == "__main__":
             continue
 
     # Wait briefly for processes to terminate
-    gone, alive = psutil.wait_procs(children, timeout=3)
+    _, alive = psutil.wait_procs(children, timeout=3)
 
     # If any processes remain, force kill them
     for process in alive:
@@ -344,26 +402,88 @@ if __name__ == "__main__":
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
-    # Additional cleanup: find any orphaned processes containing specific keywords
-    keywords = ["python", "torch", "mp", "bfts", "experiment"]
-    for proc in psutil.process_iter(["name", "cmdline"]):
+    psutil.wait_procs(alive, timeout=3)
+
+
+def write_run_status(idea_dir, status, *, stage=None, error_type=None):
+    """Save a stop marker without claiming unsupported full-run resume."""
+    status_path = osp.join(idea_dir, "run_status.json")
+    previous = {}
+    if osp.exists(status_path):
         try:
-            # Check both process name and command line arguments
-            cmdline = " ".join(proc.cmdline()).lower()
-            if any(keyword in cmdline for keyword in keywords):
-                proc.send_signal(signal.SIGTERM)
-                proc.wait(timeout=3)
-                if proc.is_running():
-                    proc.kill()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
-            continue
+            with open(status_path, "r") as f:
+                previous = json.load(f)
+        except (OSError, ValueError):
+            pass
+    previous.update(status=status, updated_at=datetime.now().isoformat())
+    if stage is not None:
+        previous["stage"] = stage
+    if error_type is not None:
+        previous["error_type"] = error_type
+    temporary_path = status_path + ".tmp"
+    with open(temporary_path, "w") as f:
+        json.dump(previous, f, indent=2)
+    os.replace(temporary_path, status_path)
 
-    # Finally, terminate the current process
-    # current_process.send_signal(signal.SIGTERM)
-    # try:
-    #     current_process.wait(timeout=3)
-    # except psutil.TimeoutExpired:
-    #     current_process.kill()
 
-    # exit the program
-    sys.exit(0)
+def main(argv=None):
+    args = parse_arguments(argv)
+    os.environ["AI_SCIENTIST_ROOT"] = osp.dirname(osp.abspath(__file__))
+    print(f"Set AI_SCIENTIST_ROOT to {os.environ['AI_SCIENTIST_ROOT']}")
+    with open(args.load_ideas, "r") as f:
+        ideas = json.load(f)
+    print(f"Loaded {len(ideas)} pregenerated ideas from {args.load_ideas}")
+    idea = ideas[args.idea_idx]
+    date = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    idea_dir = f"experiments/{date}_{idea['Name']}_attempt_{args.attempt_id}"
+    print(f"Results will be saved in {idea_dir}")
+    os.makedirs(idea_dir, exist_ok=True)
+
+    status = "failed"
+    error_type = None
+    try:
+        write_run_status(idea_dir, "running", stage="preflight")
+        inference_defaults = load_experiment_inference_defaults("bfts_config.yaml")
+        runtime = configure_from_args(
+            args,
+            artifact_dir=idea_dir,
+            argv=argv,
+            default_config=inference_defaults,
+        )
+        # Detect unavailable CLIs/authentication before scheduling experiments.
+        runtime.preflight()
+        runtime.ensure_started()
+        print(f"Using GPUs: {get_available_gpus()}")
+        run_pipeline(args, ideas, idea_dir)
+        status = "completed"
+        return 0
+    except InferenceError as exc:
+        status = "inference_failed"
+        error_type = type(exc).__name__
+        print(f"Inference stopped ({error_type}): {exc}", file=sys.stderr)
+        print(f"Completed artifacts have been retained in {idea_dir}.", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        status = "interrupted"
+        error_type = "KeyboardInterrupt"
+        return 130
+    except Exception as exc:
+        error_type = type(exc).__name__
+        raise
+    finally:
+        # Broker shutdown owns its CLI process groups.  The legacy descendant
+        # cleanup is only for this experiment's remaining worker processes.
+        for operation in (
+            lambda: save_token_tracker(idea_dir),
+            shutdown_inference,
+            cleanup_owned_processes,
+            lambda: write_run_status(idea_dir, status, error_type=error_type),
+        ):
+            try:
+                operation()
+            except Exception as cleanup_error:
+                print(f"Cleanup warning: {cleanup_error}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

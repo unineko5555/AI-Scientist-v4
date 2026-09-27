@@ -125,6 +125,8 @@ celerybeat.pid
 .env
 .venv
 .venv_jax
+.venv-cli/
+.inference/
 env/
 venv/
 ENV/

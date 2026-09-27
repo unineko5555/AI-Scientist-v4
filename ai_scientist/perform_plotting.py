@@ -9,6 +9,14 @@ import traceback
 from rich import print
 
 from ai_scientist.llm import create_client, get_response_from_llm
+from ai_scientist.inference import (
+    InferenceError,
+    add_inference_arguments,
+    configure_from_args,
+    get_runtime,
+    shutdown_inference,
+)
+from ai_scientist.inference.environment import generated_code_environment
 from ai_scientist.utils.token_tracker import token_tracker
 from ai_scientist.perform_icbinb_writeup import (
     load_idea_text,
@@ -118,6 +126,7 @@ def run_aggregator_script(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=generated_code_environment(subscription_only=get_runtime().is_cli),
         )
         aggregator_out = result.stdout + "\n" + result.stderr
         print("Aggregator script ran successfully.")
@@ -125,6 +134,8 @@ def run_aggregator_script(
         aggregator_out = (e.stdout or "") + "\n" + (e.stderr or "")
         print("Error: aggregator script returned a non-zero exit code.")
         print(e)
+    except InferenceError:
+        raise
     except Exception as e:
         aggregator_out = str(e)
         print("Error while running aggregator script.")
@@ -159,7 +170,7 @@ def aggregate_plots(
     aggregator_prompt = build_aggregator_prompt(combined_summaries_str, idea_text)
 
     # Call LLM
-    client, model_name = create_client(model)
+    client, model_name = create_client(model, role="aggregation")
     response, msg_history = None, []
     try:
         response, msg_history = get_response_from_llm(
@@ -170,6 +181,8 @@ def aggregate_plots(
             print_debug=False,
             msg_history=msg_history,
         )
+    except InferenceError:
+        raise
     except Exception:
         traceback.print_exc()
         print("Failed to get aggregator script from LLM.")
@@ -227,6 +240,8 @@ If you believe you are done, simply say: "I am done". Otherwise, please provide 
                 msg_history=msg_history,
             )
 
+        except InferenceError:
+            raise
         except Exception:
             traceback.print_exc()
             print("Failed to get reflection from LLM.")
@@ -254,7 +269,7 @@ If you believe you are done, simply say: "I am done". Otherwise, please provide 
             )
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Generate and execute a final plot aggregation script with LLM assistance."
     )
@@ -274,10 +289,17 @@ def main():
         default=5,
         help="Number of reflection steps to attempt (default: 5).",
     )
-    args = parser.parse_args()
-    aggregate_plots(
-        base_folder=args.folder, model=args.model, n_reflections=args.reflections
-    )
+    add_inference_arguments(parser)
+    parser.set_defaults(_inference_model_roles={"model": ["aggregation"]})
+    args = parser.parse_args(argv)
+    try:
+        runtime = configure_from_args(args, artifact_dir=args.folder, argv=argv)
+        runtime.preflight()
+        aggregate_plots(
+            base_folder=args.folder, model=args.model, n_reflections=args.reflections
+        )
+    finally:
+        shutdown_inference()
 
 
 if __name__ == "__main__":

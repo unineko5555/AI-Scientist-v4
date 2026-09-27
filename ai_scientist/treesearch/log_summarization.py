@@ -8,6 +8,8 @@ parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..",
 sys.path.insert(0, parent_dir)
 from ai_scientist.llm import get_response_from_llm, extract_json_between_markers
 from ai_scientist.treesearch.backend import get_ai_client
+from ai_scientist.inference.errors import InferenceError
+from ai_scientist.inference import get_runtime, resolve_api_model
 
 
 report_summarizer_sys_msg = """You are an expert machine learning researcher.
@@ -211,6 +213,8 @@ def update_summary(
         )
         summary_json = extract_json_between_markers(response[0])
         assert summary_json
+    except InferenceError:
+        raise
     except Exception as e:
         if max_retry > 0:
             print(f"Error occurred: {e}. Retrying... ({max_retry} attempts left)")
@@ -266,11 +270,13 @@ def annotate_history(journal, cfg=None):
             retry_count = 0
             while retry_count < max_retries:
                 try:
-                    if cfg.agent.get("summary", None) is not None:
+                    if cfg is not None and cfg.agent.get("summary", None) is not None:
                         model = cfg.agent.summary.model
                     else:
                         model = "gpt-4o-2024-08-06"
-                    client = get_ai_client(model)
+                    if not get_runtime().is_cli:
+                        model = resolve_api_model(model, role="summary")
+                    client = get_ai_client(model, role="summary")
                     response = get_response_from_llm(
                         overall_plan_summarizer_prompt.format(
                             prev_overall_plan=node.parent.overall_plan,
@@ -284,6 +290,8 @@ def annotate_history(journal, cfg=None):
                         "overall_plan"
                     ]
                     break
+                except InferenceError:
+                    raise
                 except Exception as e:
                     retry_count += 1
                     if retry_count == max_retries:
@@ -299,11 +307,35 @@ def annotate_history(journal, cfg=None):
 def overall_summarize(journals, cfg=None):
     from concurrent.futures import ThreadPoolExecutor
 
+    # Sub-stages are not extra main stages. Keep every node while presenting
+    # the four stable summary contracts consumed by both writeup pipelines.
+    groups = {number: Journal() for number in range(1, 5)}
+    seen = {number: set() for number in groups}
+    for stage_name, journal in list(journals):
+        number = int(stage_name.split("_", 1)[0])
+        if number not in groups:
+            raise ValueError(f"Unknown main stage in journal: {stage_name}")
+        for node in journal.nodes:
+            if node.id not in seen[number]:
+                groups[number].nodes.append(node)
+                seen[number].add(node.id)
+    all_nodes = Journal()
+    all_seen = set()
+    for journal in groups.values():
+        for node in journal.nodes:
+            if node.id not in all_seen:
+                all_nodes.nodes.append(node)
+                all_seen.add(node.id)
+    annotate_history(all_nodes, cfg=cfg)
+
     def process_stage(idx, stage_tuple):
         stage_name, journal = stage_tuple
-        annotate_history(journal, cfg=cfg)
+        if not journal.nodes:
+            return {"status": "not_run", "stage": stage_name}
         if idx in [1, 2]:
             best_node = journal.get_best_node(cfg=cfg)
+            if best_node is None:
+                return {"status": "no_good_nodes", "stage": stage_name}
             # get multi-seed results and aggregater node
             child_nodes = best_node.children
             multi_seed_nodes = [
@@ -338,22 +370,25 @@ def overall_summarize(journals, cfg=None):
             ]
             return [get_node_log(n) for n in good_leaf_nodes]
         elif idx == 0:
-            if cfg.agent.get("summary", None) is not None:
+            if cfg is not None and cfg.agent.get("summary", None) is not None:
                 model = cfg.agent.summary.get("model", "")
             else:
                 model = "gpt-4o-2024-08-06"
-            client = get_ai_client(model)
+            if not get_runtime().is_cli:
+                model = resolve_api_model(model, role="report")
+            client = get_ai_client(model, role="report")
             summary_json = get_stage_summary(journal, stage_name, model, client)
             return summary_json
 
     from tqdm import tqdm
 
     with ThreadPoolExecutor() as executor:
+        main_stages = [(f"{number}_main_stage", groups[number]) for number in range(1, 5)]
         results = list(
             tqdm(
-                executor.map(process_stage, range(len(list(journals))), journals),
+                executor.map(process_stage, range(4), main_stages),
                 desc="Processing stages",
-                total=len(list(journals)),
+                total=4,
             )
         )
         draft_summary, baseline_summary, research_summary, ablation_summary = results

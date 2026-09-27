@@ -13,6 +13,7 @@ import json
 from rich import print
 from .utils.serialize import parse_markdown_to_dict
 from .utils.metric import WorstMetricValue
+from ai_scientist.inference.errors import InferenceError
 
 
 logger = logging.getLogger(__name__)
@@ -252,13 +253,7 @@ Your research idea:\n\n
             logger.warning("Cannot save checkpoint: current_stage is None")
             return
         stage_name = "stage_" + self.current_stage.name
-        save_path = (
-            Path(self.workspace_dir).parent
-            / "logs"
-            / Path(self.workspace_dir).name
-            / stage_name
-            / "checkpoint.pkl"
-        )
+        save_path = Path(self.cfg.log_dir) / stage_name / "checkpoint.pkl"
         checkpoint = {
             "journals": self.journals,
             "stage_history": self.stage_history,
@@ -268,6 +263,7 @@ Your research idea:\n\n
             "current_stage": self.current_stage,
         }
         print("Saving checkpoint to ", save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
         with open(save_path, "wb") as f:
             pickle.dump(checkpoint, f)
 
@@ -362,6 +358,7 @@ Your research idea:\n\n
 
         try:
             evaluation = query(
+                role="stage_control",
                 system_message=eval_prompt,
                 user_message=None,
                 func_spec=stage_completion_eval_spec,
@@ -385,6 +382,8 @@ Your research idea:\n\n
                     f"[yellow]Stage {current_substage.name} not complete. Missing: {missing}[/yellow]"
                 )
                 return False, "Missing criteria: " + missing
+        except InferenceError:
+            raise
         except Exception as e:
             logger.error(
                 f"Error in sub-stage {current_substage.name} completion evaluation: {e}"
@@ -471,6 +470,7 @@ Your research idea:\n\n
 
             try:
                 evaluation = query(
+                    role="stage_control",
                     system_message=eval_prompt,
                     user_message=None,
                     func_spec=stage_completion_eval_spec,
@@ -493,6 +493,8 @@ Your research idea:\n\n
                         f"[yellow]Stage {stage.name} not complete. Missing: {missing}[/yellow]"
                     )
                     return False, "Missing criteria: " + missing
+            except InferenceError:
+                raise
             except Exception as e:
                 logger.error(f"Error in stage 2 completion evaluation: {e}")
                 return False, "Error in stage 2 completion evaluation"
@@ -613,6 +615,7 @@ Your research idea:\n\n
         try:
             # Get response from LLM
             response = query(
+                role="stage_control",
                 system_message=prompt,
                 user_message=None,
                 func_spec=substage_goal_spec,
@@ -627,13 +630,15 @@ Your research idea:\n\n
 
             return goal_str.strip(), response["sub_stage_name"]
 
+        except InferenceError:
+            raise
         except Exception as e:
             logger.error(f"Error generating sub-stage goals: {e}")
             # Provide fallback goals if LLM fails
-            return f"""
+            return (f"""
             Sub-stage Goals:
             Continue progress on main stage objectives while addressing current issues.
-            """
+            """, "continue_progress")
 
     def _create_next_substage(
         self, current_substage: Stage, journal: Journal, substage_feedback: str
@@ -658,7 +663,7 @@ Your research idea:\n\n
             + sub_stage_goal,
             max_iterations=self._get_max_iterations(main_stage_num),
             num_drafts=0,
-            stage_number=current_substage.stage_number + 1,
+            stage_number=main_stage_num,
         )
 
     def _create_next_main_stage(
@@ -676,7 +681,7 @@ Your research idea:\n\n
         sub_stage_num = 1
         sub_stage_name = "first_attempt"
         num_drafts = 0
-        stage_number = current_substage.stage_number + 1
+        stage_number = main_stage_num + 1
         description = f"first_attempt"
         main_stage_goal = self.main_stage_goals[main_stage_num + 1]
 
@@ -698,6 +703,7 @@ Your research idea:\n\n
 
             current_substage = self.current_stage
             while current_substage:  # Sub-stage loop
+                self.current_stage = current_substage
                 print(f"[green]Starting sub-stage: {current_substage.name}[/green]")
 
                 with self._create_agent_for_stage(current_substage) as agent:
@@ -1019,6 +1025,7 @@ Your research idea:\n\n
 
         try:
             response = query(
+                role="stage_control",
                 system_message=prompt,
                 user_message=None,
                 func_spec=stage_config_spec,
@@ -1027,6 +1034,8 @@ Your research idea:\n\n
             )
             return response
 
+        except InferenceError:
+            raise
         except Exception as e:
             logger.error(f"Error getting LLM response: {e}")
             # Provide a fallback configuration in case of errors
@@ -1194,6 +1203,7 @@ Your research idea:\n\n
 
         try:
             evaluation = query(
+                role="stage_control",
                 system_message=eval_prompt,
                 user_message=None,
                 func_spec=stage_progress_eval_spec,
@@ -1208,6 +1218,8 @@ Your research idea:\n\n
 
             return evaluation
 
+        except InferenceError:
+            raise
         except Exception as e:
             logger.error(f"Error in stage progression evaluation: {e}")
             return {

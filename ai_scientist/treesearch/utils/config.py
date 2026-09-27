@@ -1,8 +1,8 @@
 """configuration and setup utils"""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Hashable, cast, Literal, Optional
+from typing import Any, Hashable, cast, Literal, Optional
 
 import coolname
 import rich
@@ -107,6 +107,9 @@ class Config(Hashable):
     agent: AgentConfig
     experiment: ExperimentConfig
     debug: DebugConfig
+    # Only serializable inference settings belong in cfg. Runtime/broker handles
+    # are inherited through the environment, never pickled into journals.
+    inference: dict[str, Any] = field(default_factory=dict)
 
 
 def _get_next_logindex(dir: Path) -> int:
@@ -216,25 +219,39 @@ def prep_agent_workspace(cfg: Config):
         preproc_data(cfg.workspace_dir / "input")
 
 
-def save_run(cfg: Config, journal, stage_name: str = None):
+def save_run(cfg: Config, journal, stage_name: str = None, *, include_analysis=False):
+    """Persist the journal before optional model-dependent presentation work.
+
+    The default is deliberately inference-free, including best-node selection
+    and HTML export (the latter calls the model internally).
+    """
     if stage_name is None:
         stage_name = "NoStageRun"
     save_dir = cfg.log_dir / stage_name
-    save_dir.mkdir(parents=True, exist_ok=True)
+    save_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    save_dir.chmod(0o700)
 
     # save journal
     try:
-        serialize.dump_json(journal, save_dir / "journal.json")
+        journal_temp = save_dir / "journal.json.tmp"
+        serialize.dump_json(journal, journal_temp)
+        journal_temp.chmod(0o600)
+        journal_temp.replace(save_dir / "journal.json")
     except Exception as e:
         print(f"Error saving journal: {e}")
         raise
     # save config
     try:
-        OmegaConf.save(config=cfg, f=save_dir / "config.yaml")
+        config_temp = save_dir / "config.yaml.tmp"
+        OmegaConf.save(config=cfg, f=config_temp)
+        config_temp.chmod(0o600)
+        config_temp.replace(save_dir / "config.yaml")
     except Exception as e:
         print(f"Error saving config: {e}")
         raise
-    # create the tree + code visualization
+    if not include_analysis:
+        return save_dir
+    # create the tree + code visualization only during normal operation
     try:
         tree_export.generate(cfg, journal, save_dir / "tree_plot.html")
     except Exception as e:
@@ -257,3 +274,4 @@ def save_run(cfg: Config, journal, stage_name: str = None):
             print("No best node found yet")
     except Exception as e:
         print(f"Error saving best solution: {e}")
+        raise

@@ -3,21 +3,15 @@ import logging
 import time
 
 from .utils import FunctionSpec, OutputType, opt_messages_to_list, backoff_create
-from funcy import notnone, once, select_values
-import openai
-from rich import print
+from ai_scientist.utils.token_tracker import record_token_usage
 
 logger = logging.getLogger("ai-scientist")
 
 
-OPENAI_TIMEOUT_EXCEPTIONS = (
-    openai.RateLimitError,
-    openai.APIConnectionError,
-    openai.APITimeoutError,
-    openai.InternalServerError,
-)
-
-def get_ai_client(model: str, max_retries=2) -> openai.OpenAI:
+def get_ai_client(model: str, max_retries=2):
+    from ai_scientist.llm import _require_api_client
+    _require_api_client(None)
+    import openai
     if model.startswith("ollama/"):
         client = openai.OpenAI(
             base_url="http://localhost:11434/v1", 
@@ -34,8 +28,10 @@ def query(
     func_spec: FunctionSpec | None = None,
     **model_kwargs,
 ) -> tuple[OutputType, float, int, int, dict]:
+    import openai
+
     client = get_ai_client(model_kwargs.get("model"), max_retries=0)
-    filtered_kwargs: dict = select_values(notnone, model_kwargs)  # type: ignore
+    filtered_kwargs = {key: value for key, value in model_kwargs.items() if value is not None}
 
     messages = opt_messages_to_list(system_message, user_message)
 
@@ -50,11 +46,12 @@ def query(
     t0 = time.time()
     completion = backoff_create(
         client.chat.completions.create,
-        OPENAI_TIMEOUT_EXCEPTIONS,
+        (openai.RateLimitError, openai.APIConnectionError, openai.APITimeoutError, openai.InternalServerError),
         messages=messages,
         **filtered_kwargs,
     )
     req_time = time.time() - t0
+    record_token_usage(completion, prompt=user_message, system_message=system_message)
 
     choice = completion.choices[0]
 
@@ -70,6 +67,7 @@ def query(
         try:
             print(f"[cyan]Raw func call response: {choice}[/cyan]")
             output = json.loads(choice.message.tool_calls[0].function.arguments)
+            func_spec.validate(output)
         except json.JSONDecodeError as e:
             logger.error(
                 f"Error decoding the function arguments: {choice.message.tool_calls[0].function.arguments}"

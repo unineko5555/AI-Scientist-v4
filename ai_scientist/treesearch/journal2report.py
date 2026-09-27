@@ -23,6 +23,7 @@ def journal2report(journal: Journal, task_desc: dict, rcfg: StageConfig):
         f"and the research idea description is: <research_proposal>{task_desc}<\\research_proposal>."
     )
     return query(
+        role="report",
         system_message=system_prompt_dict,
         user_message=context_prompt,
         model=rcfg.model,

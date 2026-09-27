@@ -427,6 +427,13 @@ async function loadAllStageData(baseTreeData) {
 
         if (response.ok) {
           const data = await response.json();
+          // Artifact URLs in each stage JSON are relative to that JSON, not to
+          // the unified viewer (which lives one directory higher).
+          if (data && Array.isArray(data.plots)) {
+            data.plots = data.plots.map(plots =>
+              plots.map(path => new URL(path, response.url).href)
+            );
+          }
 
           // Validate the loaded data
           if (data && data.layout && data.edges) {
@@ -668,14 +675,24 @@ const setNodeInfo = (code, plan, plot_code, plot_plan, metrics = null, exc_type 
   }
 };
 
+function applyTreeLocationDefaults(data, href) {
+  const page = new URL(href);
+  const stageMatch = page.pathname.match(/\/stage_(\d+)(?:_[^/]*)?\/[^/]*$/);
+  // Python has the authoritative HTML/artifact locations. Infer only for old
+  // exported data which lacks those fields, never overwrite explicit metadata.
+  if (!data.log_dir_path) {
+    data.log_dir_path = new URL(stageMatch ? '../' : './', page).href;
+  }
+  if (!data.current_stage) {
+    data.current_stage = stageMatch ? `Stage_${stageMatch[1]}` : 'Stage_1';
+  }
+  return data;
+}
+
 // Initialize with the provided tree data
 const treeStructData = "PLACEHOLDER_TREE_DATA";
 
-// Add log directory path and stage info to the tree data
-treeStructData.log_dir_path = window.location.pathname.split('/').slice(0, -1).join('/');
-treeStructData.current_stage = window.location.pathname.includes('stage_')
-  ? window.location.pathname.split('stage_')[1].split('/')[0]
-  : 'Stage_1';
+applyTreeLocationDefaults(treeStructData, window.location.href);
 
 // Initialize background color
 window.bgColCurrent = bgCol;

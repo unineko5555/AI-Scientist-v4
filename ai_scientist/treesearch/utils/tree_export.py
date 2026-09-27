@@ -1,14 +1,43 @@
 """Export journal to HTML visualization of tree + code."""
 
 import json
+import copy
+import os
 import textwrap
 from pathlib import Path
+from urllib.parse import quote, unquote, urlparse
 
 import numpy as np
 from igraph import Graph
 from ..journal import Journal
 
 from rich import print
+
+
+def _plot_urls(node, out_path):
+    """Resolve scientific artifact paths relative to the actual HTML location."""
+    if out_path is None or not node.plot_paths:
+        return list(node.plots)
+    return [
+        quote(Path(os.path.relpath(Path(path).resolve(), Path(out_path).parent.resolve())).as_posix(), safe="/")
+        for path in node.plot_paths
+    ]
+
+
+def _rebase_plot_urls(tree_data, source_dir, destination_dir):
+    data = copy.deepcopy(tree_data)
+    rebased = []
+    for node_plots in data.get("plots", []):
+        urls = []
+        for url in node_plots:
+            if urlparse(url).scheme:
+                urls.append(url)
+            else:
+                path = (Path(source_dir) / unquote(url)).resolve()
+                urls.append(quote(Path(os.path.relpath(path, destination_dir)).as_posix(), safe="/"))
+        rebased.append(urls)
+    data["plots"] = rebased
+    return data
 
 
 def get_edges(journal: Journal):
@@ -209,7 +238,7 @@ def cfg_to_tree_struct(cfg, jou: Journal, out_path: Path = None):
         raise
 
     try:
-        tmp["plots"] = [n.plots for n in jou]
+        tmp["plots"] = [_plot_urls(n, out_path) for n in jou]
     except Exception as e:
         print(f"Error setting plots: {e}")
         raise
@@ -355,6 +384,10 @@ def cfg_to_tree_struct(cfg, jou: Journal, out_path: Path = None):
     if out_path:
         log_dir = out_path.parent.parent
         tmp["completed_stages"] = get_completed_stages(log_dir)
+        tmp["log_dir_path"] = ".."
+        parts = out_path.parent.name.split("_")
+        if len(parts) > 1 and parts[1].isdigit():
+            tmp["current_stage"] = f"Stage_{parts[1]}"
 
     return tmp
 
@@ -449,9 +482,11 @@ def create_unified_viz(cfg, current_stage_viz_path):
         if current_stage_data_path.exists():
             with open(current_stage_data_path, "r") as f:
                 base_data = json.load(f)
+                base_data = _rebase_plot_urls(base_data, current_stage_viz_path.parent, log_dir)
                 # Add the necessary metadata
                 base_data["current_stage"] = current_stage
                 base_data["completed_stages"] = completed_stages
+                base_data["log_dir_path"] = "."
         else:
             # If we can't load the tree data, create a minimal structure
             base_data = {

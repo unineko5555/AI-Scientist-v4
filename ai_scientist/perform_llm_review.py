@@ -1,14 +1,75 @@
 import os
 import json
+import warnings
 import numpy as np
-from pypdf import PdfReader
-import pymupdf
-import pymupdf4llm
 from ai_scientist.llm import (
     get_response_from_llm,
     get_batch_responses_from_llm,
     extract_json_between_markers,
 )
+from ai_scientist.inference import is_cli_client
+from ai_scientist.inference.errors import IncompleteOutput, InvalidStructuredOutput
+from ai_scientist.inference.schema import validate_structured
+
+
+# Keep the full V2 review contract, including legitimate negative evaluations.
+# Scores are integers, not booleans or strings that happen to coerce to numbers.
+REVIEW_SCORE_LIMITS = {
+    "Originality": (1, 4),
+    "Quality": (1, 4),
+    "Clarity": (1, 4),
+    "Significance": (1, 4),
+    "Soundness": (1, 4),
+    "Presentation": (1, 4),
+    "Contribution": (1, 4),
+    "Overall": (1, 10),
+    "Confidence": (1, 5),
+}
+REVIEW_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "Summary": {"type": "string"},
+        "Strengths": {"type": "array", "items": {"type": "string"}},
+        "Weaknesses": {"type": "array", "items": {"type": "string"}},
+        "Originality": {"type": "integer", "minimum": 1, "maximum": 4},
+        "Quality": {"type": "integer", "minimum": 1, "maximum": 4},
+        "Clarity": {"type": "integer", "minimum": 1, "maximum": 4},
+        "Significance": {"type": "integer", "minimum": 1, "maximum": 4},
+        "Questions": {"type": "array", "items": {"type": "string"}},
+        "Limitations": {"type": "array", "items": {"type": "string"}},
+        "Ethical Concerns": {"type": "boolean"},
+        "Soundness": {"type": "integer", "minimum": 1, "maximum": 4},
+        "Presentation": {"type": "integer", "minimum": 1, "maximum": 4},
+        "Contribution": {"type": "integer", "minimum": 1, "maximum": 4},
+        "Overall": {"type": "integer", "minimum": 1, "maximum": 10},
+        "Confidence": {"type": "integer", "minimum": 1, "maximum": 5},
+        "Decision": {"type": "string", "enum": ["Accept", "Reject"]},
+    },
+    "required": [
+        "Summary", "Strengths", "Weaknesses", "Originality", "Quality", "Clarity",
+        "Significance", "Questions", "Limitations", "Ethical Concerns", "Soundness",
+        "Presentation", "Contribution", "Overall", "Confidence", "Decision",
+    ],
+    "additionalProperties": False,
+}
+
+
+def validate_review(review):
+    """Validate a complete review without repairing or inventing its science."""
+    validate_structured(review, REVIEW_SCHEMA)
+    # JSON Schema regards e.g. 1.0 as an integer. The stored V2 ratings are
+    # actual JSON/Python integers; retain that stricter serialization contract.
+    if any(type(review[score]) is not int for score in REVIEW_SCORE_LIMITS):
+        raise InvalidStructuredOutput("Review ratings must be integer values")
+    return review
+
+
+def _review_from_text(text):
+    try:
+        review = extract_json_between_markers(text)
+    except (TypeError, ValueError) as exc:
+        raise InvalidStructuredOutput("Review response did not contain valid JSON") from exc
+    return validate_review(review)
 
 reviewer_system_prompt_base = (
     "You are an AI researcher who is reviewing a paper that was submitted to a prestigious ML venue."
@@ -135,6 +196,9 @@ def perform_review(
     reviewer_system_prompt=reviewer_system_prompt_neg,
     review_instruction_form=neurips_form,
 ):
+    if type(num_reviews_ensemble) is not int or num_reviews_ensemble < 1:
+        raise ValueError("num_reviews_ensemble must be a positive integer")
+    cli_mode = is_cli_client(client)
     if num_fs_examples > 0:
         fs_prompt = get_review_fewshot_examples(num_fs_examples)
         base_prompt = review_instruction_form + fs_prompt
@@ -157,41 +221,63 @@ Here is the paper you are asked to review:
             msg_history=msg_history,
             temperature=0.75,
             n_responses=num_reviews_ensemble,
+            schema=REVIEW_SCHEMA if cli_mode else None,
         )
+        if len(llm_reviews) != len(msg_histories):
+            raise IncompleteOutput("Ensemble review texts and histories have different lengths")
+        if cli_mode and len(llm_reviews) != num_reviews_ensemble:
+            raise IncompleteOutput(
+                "CLI ensemble did not return every requested independent review"
+            )
         parsed_reviews = []
+        valid_indices = []
         for idx, rev in enumerate(llm_reviews):
             try:
-                parsed_reviews.append(extract_json_between_markers(rev))
-            except Exception as e:
-                print(f"Ensemble review {idx} failed: {e}")
-        parsed_reviews = [r for r in parsed_reviews if r is not None]
-        review = get_meta_review(model, client, temperature, parsed_reviews)
-        if review is None:
-            review = parsed_reviews[0]
-        for score, limits in [
-            ("Originality", (1, 4)),
-            ("Quality", (1, 4)),
-            ("Clarity", (1, 4)),
-            ("Significance", (1, 4)),
-            ("Soundness", (1, 4)),
-            ("Presentation", (1, 4)),
-            ("Contribution", (1, 4)),
-            ("Overall", (1, 10)),
-            ("Confidence", (1, 5)),
-        ]:
-            scores = []
-            for r in parsed_reviews:
-                if score in r and limits[0] <= r[score] <= limits[1]:
-                    scores.append(r[score])
-            if scores:
-                review[score] = int(round(np.mean(scores)))
-        msg_history = msg_histories[0][:-1]
+                parsed_reviews.append(_review_from_text(rev))
+                valid_indices.append(idx)
+            except InvalidStructuredOutput as exc:
+                if cli_mode:
+                    raise
+                warnings.warn(
+                    f"Discarding invalid legacy API ensemble review {idx + 1}: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        if not parsed_reviews:
+            raise InvalidStructuredOutput("No complete valid reviews were returned by the ensemble")
+        if len(parsed_reviews) != num_reviews_ensemble:
+            # Preserve V2's legacy API subset policy, but make it explicit.
+            # Subscription CLI mode never silently reduces the ensemble size.
+            warnings.warn(
+                f"Legacy API ensemble uses {len(parsed_reviews)} valid reviews out of "
+                f"{num_reviews_ensemble} requested; no missing reviews were fabricated.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        try:
+            review = validate_review(get_meta_review(model, client, temperature, parsed_reviews))
+        except InvalidStructuredOutput:
+            if cli_mode:
+                raise
+            warnings.warn(
+                "Invalid legacy API meta-review; retaining the first valid review's "
+                "decision and text before averaging the ensemble scores.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            review = dict(parsed_reviews[0])
+        # Preserve V2's nine rounded arithmetic means; the meta-review's
+        # decision is not replaced by a majority vote of the individual ones.
+        for score in REVIEW_SCORE_LIMITS:
+            review[score] = int(round(np.mean([r[score] for r in parsed_reviews])))
+        review = validate_review(review)
+        msg_history = msg_histories[valid_indices[0]][:-1]
         msg_history += [
             {
                 "role": "assistant",
                 "content": f"""
 THOUGHT:
-I will start by aggregating the opinions of {num_reviews_ensemble} reviewers that I previously obtained.
+I will start by aggregating the opinions of {len(parsed_reviews)} reviewers that I previously obtained.
 
 REVIEW JSON:
 ```json
@@ -209,21 +295,26 @@ REVIEW JSON:
             print_debug=False,
             msg_history=msg_history,
             temperature=temperature,
+            schema=REVIEW_SCHEMA if cli_mode else None,
         )
-        review = extract_json_between_markers(llm_review)
+        review = _review_from_text(llm_review)
 
     if num_reflections > 1:
         for j in range(num_reflections - 1):
+            # This remains mixed THOUGHT/JSON text: the original "I am done"
+            # marker lives outside the review object. Host validation below
+            # preserves that stopping rule without adding a scientific field.
             text, msg_history = get_response_from_llm(
-                reviewer_reflection_prompt,
+                reviewer_reflection_prompt.format(
+                    current_round=j + 2, num_reflections=num_reflections
+                ),
                 client=client,
                 model=model,
                 system_message=reviewer_system_prompt,
                 msg_history=msg_history,
                 temperature=temperature,
             )
-            review = extract_json_between_markers(text)
-            assert review is not None, "Failed to extract JSON from LLM output"
+            review = _review_from_text(text)
             if "I am done" in text:
                 break
 
@@ -256,9 +347,11 @@ ONLY INCLUDE "I am done" IF YOU ARE MAKING NO MORE CHANGES."""
 
 def load_paper(pdf_path, num_pages=None, min_size=100):
     try:
+        import pymupdf4llm
         if num_pages is None:
             text = pymupdf4llm.to_markdown(pdf_path)
         else:
+            from pypdf import PdfReader
             reader = PdfReader(pdf_path)
             min_pages = min(len(reader.pages), num_pages)
             text = pymupdf4llm.to_markdown(pdf_path, pages=list(range(min_pages)))
@@ -267,6 +360,7 @@ def load_paper(pdf_path, num_pages=None, min_size=100):
     except Exception as e:
         print(f"Error with pymupdf4llm, falling back to pymupdf: {e}")
         try:
+            import pymupdf
             doc = pymupdf.open(pdf_path)
             if num_pages:
                 doc = doc[:num_pages]
@@ -277,6 +371,7 @@ def load_paper(pdf_path, num_pages=None, min_size=100):
                 raise Exception("Text too short")
         except Exception as e:
             print(f"Error with pymupdf, falling back to pypdf: {e}")
+            from pypdf import PdfReader
             reader = PdfReader(pdf_path)
             if num_pages is None:
                 pages = reader.pages
@@ -347,8 +442,11 @@ Be critical and cautious in your decision, find consensus, and respect the opini
 
 
 def get_meta_review(model, client, temperature, reviews):
+    if not reviews:
+        raise InvalidStructuredOutput("A meta-review requires at least one valid review")
     review_text = ""
     for i, r in enumerate(reviews):
+        validate_review(r)
         review_text += f"""
 Review {i + 1}/{len(reviews)}:
 ```
@@ -364,6 +462,6 @@ Review {i + 1}/{len(reviews)}:
         print_debug=False,
         msg_history=None,
         temperature=temperature,
+        schema=REVIEW_SCHEMA if is_cli_client(client) else None,
     )
-    meta_review = extract_json_between_markers(llm_review)
-    return meta_review
+    return _review_from_text(llm_review)

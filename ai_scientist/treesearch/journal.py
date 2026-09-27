@@ -12,6 +12,7 @@ from .interpreter import ExecutionResult
 from .utils.metric import MetricValue, WorstMetricValue
 from .utils.response import trim_long_string
 from .backend import FunctionSpec, query
+from ai_scientist.inference.errors import InferenceError, InvalidStructuredOutput
 
 from rich import print
 
@@ -19,6 +20,15 @@ import logging
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def _artifact_path(path):
+    """Keep legacy relative paths where possible, including external workspaces."""
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(Path.cwd()))
+    except ValueError:
+        return str(resolved)
 
 node_selection_spec = FunctionSpec(
     name="select_best_implementation",
@@ -237,7 +247,7 @@ class Node(DataClassJsonMixin):
             "exc_stack": self.exc_stack,
             "analysis": self.analysis,
             "exp_results_dir": (
-                str(Path(self.exp_results_dir).resolve().relative_to(os.getcwd()))
+                _artifact_path(self.exp_results_dir)
                 if self.exp_results_dir
                 else None
             ),
@@ -253,6 +263,11 @@ class Node(DataClassJsonMixin):
             },
             "is_buggy": self.is_buggy,
             "is_buggy_plots": self.is_buggy_plots,
+            "plot_term_out": self.plot_term_out,
+            "plot_exec_time": self.plot_exec_time,
+            "plot_exc_type": self.plot_exc_type,
+            "plot_exc_info": self.plot_exc_info,
+            "plot_exc_stack": self.plot_exc_stack,
             "parent_id": None if self.parent is None else self.parent.id,
             "children": [child.id for child in self.children] if self.children else [],
             "plot_data": self.plot_data,
@@ -260,7 +275,7 @@ class Node(DataClassJsonMixin):
             "plots": self.plots,
             "plot_paths": (
                 [
-                    str(Path(p).resolve().relative_to(os.getcwd()))
+                    _artifact_path(p)
                     for p in self.plot_paths
                 ]
                 if self.plot_paths
@@ -270,11 +285,7 @@ class Node(DataClassJsonMixin):
                 {
                     **analysis,
                     "plot_path": (
-                        str(
-                            Path(analysis["plot_path"])
-                            .resolve()
-                            .relative_to(os.getcwd())
-                        )
+                        _artifact_path(analysis["plot_path"])
                         if analysis.get("plot_path")
                         else None
                     ),
@@ -293,13 +304,14 @@ class Node(DataClassJsonMixin):
     @classmethod
     def from_dict(cls, data: Dict, journal: Optional[Journal] = None) -> "Node":
         """Create a Node from a dictionary, optionally linking to journal for relationships"""
+        data = copy.deepcopy(data)
         # Remove relationship IDs from constructor data
         parent_id = data.pop("parent_id", None)
         children = data.pop("children", [])
 
         # Handle metric conversion
         metric_data = data.pop("metric", None)
-        if metric_data:
+        if metric_data is not None:
             if isinstance(metric_data, dict):
                 data["metric"] = MetricValue(
                     value=metric_data["value"],
@@ -426,6 +438,9 @@ class Journal:
         else:
             nodes = self.nodes
 
+        if not nodes:
+            return None
+
         if use_val_metric_only:
             return max(nodes, key=lambda n: n.metric)
 
@@ -474,6 +489,7 @@ class Journal:
                 model = cfg.agent.select_node.model
                 temperature = cfg.agent.select_node.temp
             selection = query(
+                role="node_selection",
                 system_message=prompt,
                 user_message=None,
                 func_spec=node_selection_spec,
@@ -493,9 +509,10 @@ class Journal:
                 logger.warning(f"Reasoning: {selection['reasoning']}")
                 return selected_node
             else:
-                logger.warning("Falling back to metric-based selection")
-                return max(nodes, key=lambda n: n.metric)
+                raise InvalidStructuredOutput("Best-node selection returned an unknown candidate ID")
 
+        except InferenceError:
+            raise
         except Exception as e:
             logger.error(f"Error in LLM selection process: {e}")
             logger.warning("Falling back to metric-based selection")
@@ -534,6 +551,7 @@ class Journal:
             prompt["Failed Experiments"] += failure_info
 
         summary = query(
+            role="summary",
             system_message=prompt,
             user_message=(
                 "Please provide a comprehensive summary of the experimental progress that includes:\n"
@@ -588,20 +606,22 @@ class Journal:
                 ) as f:
                     json.dump(summary, f, indent=2)
 
+        best_node = self.get_best_node(cfg=cfg)
         summary_prompt = {
             "Introduction": "Synthesize the experimental findings from this stage",
             "Node Summaries": node_summaries,
             "Best Node": (
                 {
-                    "id": self.get_best_node().id,
-                    "metric": str(self.get_best_node(cfg=cfg).metric),
+                    "id": best_node.id,
+                    "metric": str(best_node.metric),
                 }
-                if self.get_best_node(cfg=cfg)
+                if best_node
                 else None
             ),
         }
 
         stage_summary = query(
+            role="summary",
             system_message=summary_prompt,
             user_message="Generate a comprehensive summary of the experimental findings in this stage",
             model=cfg.agent.summary.model if cfg.agent.get("summary", None) else "gpt-4o",

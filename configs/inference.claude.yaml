@@ -1,0 +1,19 @@
+# Use only the official Claude Code CLI with a first-party subscription login.
+inference:
+  mode: cli
+  subscription_only: true
+  default:
+    backend: claude_cli
+    model: null
+  providers:
+    claude_cli:
+      executable: claude
+      max_in_flight: 1
+  history_mode: explicit_stateless
+  unsupported_parameter_policy: warn_and_record
+  overflow_policy: error
+  fallback: none
+  queue_timeout_seconds: 3600
+  request_timeout_seconds: 1800
+  transient_retry_limit: 2
+  schema_repair_limit: 1

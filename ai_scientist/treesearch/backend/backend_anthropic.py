@@ -2,19 +2,13 @@ import time
 import os
 
 from .utils import FunctionSpec, OutputType, opt_messages_to_list, backoff_create
-from funcy import notnone, once, select_values
-import anthropic
+from ai_scientist.utils.token_tracker import record_token_usage
 
 
-ANTHROPIC_TIMEOUT_EXCEPTIONS = (
-    anthropic.RateLimitError,
-    anthropic.APIConnectionError,
-    anthropic.APITimeoutError,
-    anthropic.InternalServerError,
-    anthropic.APIStatusError,
-)
-
-def get_ai_client(model : str, max_retries=2) -> anthropic.AnthropicBedrock:
+def get_ai_client(model : str, max_retries=2):
+    from ai_scientist.llm import _require_api_client
+    _require_api_client(None)
+    import anthropic
     client = anthropic.AnthropicBedrock(max_retries=max_retries)
     return client
 
@@ -24,9 +18,11 @@ def query(
     func_spec: FunctionSpec | None = None,
     **model_kwargs,
 ) -> tuple[OutputType, float, int, int, dict]:
+    import anthropic
+
     client = get_ai_client(model_kwargs.get("model"), max_retries=0)
 
-    filtered_kwargs: dict = select_values(notnone, model_kwargs)  # type: ignore
+    filtered_kwargs = {key: value for key, value in model_kwargs.items() if value is not None}
     if "max_tokens" not in filtered_kwargs:
         filtered_kwargs["max_tokens"] = 8192  # default for Claude models
 
@@ -49,11 +45,13 @@ def query(
     t0 = time.time()
     message = backoff_create(
         client.messages.create,
-        ANTHROPIC_TIMEOUT_EXCEPTIONS,
+        (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.APITimeoutError,
+         anthropic.InternalServerError, anthropic.APIStatusError),
         messages=messages,
         **filtered_kwargs,
     )
     req_time = time.time() - t0
+    record_token_usage(message, prompt=user_message, system_message=system_message)
     print(filtered_kwargs)
 
     if "thinking" in filtered_kwargs:

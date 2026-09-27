@@ -14,6 +14,10 @@ copy_data: True
 
 exp_name: run # a random experiment name will be generated if not provided
 
+# Empty preserves legacy API behavior. A launcher inference profile overrides
+# this mapping and is propagated to all tree workers via the shared runtime.
+inference: {}
+
 # settings for code execution
 exec:
   timeout: 3600

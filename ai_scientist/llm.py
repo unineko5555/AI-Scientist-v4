@@ -1,12 +1,76 @@
 import json
 import os
 import re
+from copy import deepcopy
 from typing import Any
-from ai_scientist.utils.token_tracker import track_token_usage
+from ai_scientist.utils.token_tracker import record_token_usage, track_token_usage
+from ai_scientist.inference import generate, get_cli_client, is_cli_client, resolve_api_model
+from ai_scientist.inference.errors import ConfigurationError
 
-import anthropic
-import backoff
-import openai
+try:
+    import anthropic
+except ModuleNotFoundError as exc:
+    if exc.name != "anthropic":
+        raise
+    anthropic = None
+try:
+    import openai
+except ModuleNotFoundError as exc:
+    if exc.name != "openai":
+        raise
+    openai = None
+try:
+    import backoff
+except ModuleNotFoundError as exc:
+    if exc.name != "backoff":
+        raise
+    backoff = None
+
+
+def _api_retry(function):
+    """Keep API retries optional; CLI errors use the gateway's bounded policy."""
+    if backoff is None:
+        return function
+    exceptions = tuple(
+        getattr(module, name)
+        for module, names in (
+            (openai, ("RateLimitError", "APITimeoutError", "InternalServerError")),
+            (anthropic, ("RateLimitError",)),
+        )
+        if module is not None
+        for name in names
+    )
+    return backoff.on_exception(backoff.expo, exceptions)(function)
+
+
+def _require_sdk(module, name):
+    if module is None:
+        raise ImportError(f"The {name} package is required for API mode, not CLI mode.")
+    return module
+
+
+def _require_api_client(client):
+    """Do not let a stale/raw SDK client bypass subscription-only routing."""
+    if is_cli_client(client) or get_cli_client() is not None:
+        raise ConfigurationError("Raw SDK calls are disabled in CLI mode; use the shared inference facade")
+
+
+def _cli_text_response(prompt, client, system_message, msg_history, temperature, schema=None):
+    history = deepcopy(msg_history) if msg_history is not None else []
+    result = generate(
+        client,
+        prompt=prompt,
+        system_message=system_message,
+        msg_history=history,
+        temperature=temperature,
+        max_tokens=MAX_NUM_TOKENS,
+        schema=schema,
+    )
+    updated = history + [
+        {"role": "user", "content": deepcopy(prompt)},
+        {"role": "assistant", "content": result.text},
+    ]
+    return result.text, updated
 
 MAX_NUM_TOKENS = 4096
 
@@ -74,16 +138,7 @@ AVAILABLE_LLMS = [
 
 
 # Get N responses from a single message, used for ensembling.
-@backoff.on_exception(
-    backoff.expo,
-    (
-        openai.RateLimitError,
-        openai.APITimeoutError,
-        openai.InternalServerError,
-        anthropic.RateLimitError,
-    ),
-)
-@track_token_usage
+@_api_retry
 def get_batch_responses_from_llm(
     prompt,
     client,
@@ -93,11 +148,22 @@ def get_batch_responses_from_llm(
     msg_history=None,
     temperature=0.7,
     n_responses=1,
+    schema=None,
 ) -> tuple[list[str], list[list[dict[str, Any]]]]:
+    if not isinstance(n_responses, int) or isinstance(n_responses, bool) or n_responses < 1:
+        raise ValueError("n_responses must be a positive integer")
+    if is_cli_client(client):
+        responses = [
+            _cli_text_response(prompt, client, system_message, msg_history, temperature, schema)
+            for _ in range(n_responses)
+        ]
+        return [item[0] for item in responses], [item[1] for item in responses]
+    _require_api_client(client)
     msg = prompt
     if msg_history is None:
         msg_history = []
 
+    response = None
     if model.startswith("ollama/"):
         new_msg_history = msg_history + [{"role": "user", "content": msg}]
         response = client.chat.completions.create(
@@ -193,11 +259,20 @@ def get_batch_responses_from_llm(
                 model,
                 system_message,
                 print_debug=False,
-                msg_history=None,
+                msg_history=deepcopy(msg_history),
                 temperature=temperature,
+                schema=schema,
             )
             content.append(c)
             new_msg_history.append(hist)
+
+    if response is not None:
+        record_token_usage(response, prompt=msg, system_message=system_message)
+    if schema is not None:
+        from ai_scientist.inference.schema import validate_structured
+        for answer in content:
+            validate_structured(extract_json_between_markers(answer), schema)
+    new_msg_history = [deepcopy(history) for history in new_msg_history]
 
     if print_debug:
         # Just print the first one.
@@ -214,6 +289,7 @@ def get_batch_responses_from_llm(
 
 @track_token_usage
 def make_llm_call(client, model, temperature, system_message, prompt):
+    _require_api_client(client)
     if model.startswith("ollama/"):
         return client.chat.completions.create(
             model=model.replace("ollama/", ""),
@@ -255,15 +331,7 @@ def make_llm_call(client, model, temperature, system_message, prompt):
         raise ValueError(f"Model {model} not supported.")
 
 
-@backoff.on_exception(
-    backoff.expo,
-    (
-        openai.RateLimitError,
-        openai.APITimeoutError,
-        openai.InternalServerError,
-        anthropic.RateLimitError,
-    ),
-)
+@_api_retry
 def get_response_from_llm(
     prompt,
     client,
@@ -272,7 +340,11 @@ def get_response_from_llm(
     print_debug=False,
     msg_history=None,
     temperature=0.7,
+    schema=None,
 ) -> tuple[str, list[dict[str, Any]]]:
+    if is_cli_client(client):
+        return _cli_text_response(prompt, client, system_message, msg_history, temperature, schema)
+    _require_api_client(client)
     msg = prompt
     if msg_history is None:
         msg_history = []
@@ -437,6 +509,13 @@ def get_response_from_llm(
     else:
         raise ValueError(f"Model {model} not supported.")
 
+    # The GPT/reasoning helper already records its raw SDK response.
+    if not ("gpt" in model or "o1" in model or "o3" in model):
+        record_token_usage(response, prompt=msg, system_message=system_message)
+    if schema is not None:
+        from ai_scientist.inference.schema import validate_structured
+        validate_structured(extract_json_between_markers(content), schema)
+
     if print_debug:
         print()
         print("*" * 20 + " LLM START " + "*" * 20)
@@ -449,62 +528,66 @@ def get_response_from_llm(
     return content, new_msg_history
 
 
-def extract_json_between_markers(llm_output: str) -> dict | None: 
-    # Regular expression pattern to find JSON content between ```json and ```
-    json_pattern = r"```json(.*?)```"
-    matches = re.findall(json_pattern, llm_output, re.DOTALL)
-
-    if not matches:
-        # Fallback: Try to find any JSON-like content in the output
-        json_pattern = r"\{.*?\}"
-        matches = re.findall(json_pattern, llm_output, re.DOTALL)
-
-    for json_string in matches:
-        json_string = json_string.strip()
+def extract_json_between_markers(llm_output: str) -> dict | None:
+    """Accept native JSON or fenced V2 responses without truncating nested data."""
+    if not isinstance(llm_output, str):
+        return None
+    candidates = re.findall(r"```(?:json)?\s*(.*?)```", llm_output, re.DOTALL)
+    candidates.append(llm_output.strip())
+    decoder = json.JSONDecoder()
+    for candidate in candidates:
         try:
-            parsed_json = json.loads(json_string)
-            return parsed_json
+            value = json.loads(candidate)
+            if isinstance(value, dict):
+                return value
         except json.JSONDecodeError:
-            # Attempt to fix common JSON issues
-            try:
-                # Remove invalid control characters
-                json_string_clean = re.sub(r"[\x00-\x1F\x7F]", "", json_string)
-                parsed_json = json.loads(json_string_clean)
-                return parsed_json
-            except json.JSONDecodeError:
-                continue  # Try next match
+            pass
+    # Legacy responses can have un-fenced reasoning before a JSON object.
+    # raw_decode respects nested braces and braces inside JSON strings.
+    for match in re.finditer(r"\{", llm_output):
+        try:
+            value, _ = decoder.raw_decode(llm_output[match.start():])
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            continue
+    return None
 
-    return None  # No valid JSON found
 
-
-def create_client(model) -> tuple[Any, str]:
+def create_client(model=None, *, role="default") -> tuple[Any, str | None]:
+    cli_client = get_cli_client(model, role=role)
+    if cli_client is not None:
+        return cli_client, cli_client.model
+    model = resolve_api_model(model, role=role)
+    if not isinstance(model, str):
+        raise ValueError("An explicit model is required in API mode")
     if model.startswith("claude-"):
         print(f"Using Anthropic API with model {model}.")
-        return anthropic.Anthropic(), model
+        return _require_sdk(anthropic, "anthropic").Anthropic(), model
     elif model.startswith("bedrock") and "claude" in model:
         client_model = model.split("/")[-1]
         print(f"Using Amazon Bedrock with model {client_model}.")
-        return anthropic.AnthropicBedrock(), client_model
+        return _require_sdk(anthropic, "anthropic").AnthropicBedrock(), client_model
     elif model.startswith("vertex_ai") and "claude" in model:
         client_model = model.split("/")[-1]
         print(f"Using Vertex AI with model {client_model}.")
-        return anthropic.AnthropicVertex(), client_model
+        return _require_sdk(anthropic, "anthropic").AnthropicVertex(), client_model
     elif model.startswith("ollama/"):
         print(f"Using Ollama with model {model}.")
-        return openai.OpenAI(
+        return _require_sdk(openai, "openai").OpenAI(
             api_key=os.environ.get("OLLAMA_API_KEY", ""),
             base_url="http://localhost:11434/v1",
         ), model
     elif "gpt" in model:
         print(f"Using OpenAI API with model {model}.")
-        return openai.OpenAI(), model
+        return _require_sdk(openai, "openai").OpenAI(), model
     elif "o1" in model or "o3" in model:
         print(f"Using OpenAI API with model {model}.")
-        return openai.OpenAI(), model
+        return _require_sdk(openai, "openai").OpenAI(), model
     elif model == "deepseek-coder-v2-0724":
         print(f"Using OpenAI API with {model}.")
         return (
-            openai.OpenAI(
+            _require_sdk(openai, "openai").OpenAI(
                 api_key=os.environ["DEEPSEEK_API_KEY"],
                 base_url="https://api.deepseek.com",
             ),
@@ -516,7 +599,7 @@ def create_client(model) -> tuple[Any, str]:
         if "HUGGINGFACE_API_KEY" not in os.environ:
             raise ValueError("HUGGINGFACE_API_KEY environment variable not set")
         return (
-            openai.OpenAI(
+            _require_sdk(openai, "openai").OpenAI(
                 api_key=os.environ["HUGGINGFACE_API_KEY"],
                 base_url="https://api-inference.huggingface.co/models/agentica-org/DeepCoder-14B-Preview",
             ),
@@ -525,7 +608,7 @@ def create_client(model) -> tuple[Any, str]:
     elif model == "llama3.1-405b":
         print(f"Using OpenAI API with {model}.")
         return (
-            openai.OpenAI(
+            _require_sdk(openai, "openai").OpenAI(
                 api_key=os.environ["OPENROUTER_API_KEY"],
                 base_url="https://openrouter.ai/api/v1",
             ),
@@ -534,7 +617,7 @@ def create_client(model) -> tuple[Any, str]:
     elif 'gemini' in model:
         print(f"Using OpenAI API with {model}.")
         return (
-            openai.OpenAI(
+            _require_sdk(openai, "openai").OpenAI(
                 api_key=os.environ["GEMINI_API_KEY"],
                 base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             ),

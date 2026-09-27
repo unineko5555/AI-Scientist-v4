@@ -14,7 +14,12 @@ from ai_scientist.llm import (
     get_response_from_llm,
     extract_json_between_markers,
     create_client,
-    AVAILABLE_LLMS,
+)
+from ai_scientist.inference import (
+    InferenceError,
+    add_inference_arguments,
+    configure_from_args,
+    shutdown_inference,
 )
 
 from ai_scientist.utils.token_tracker import track_token_usage
@@ -448,6 +453,8 @@ This JSON will be automatically parsed, so ensure the format is precise."""
         assert json_output is not None, "Failed to extract JSON from LLM output"
         query = json_output["Query"]
         papers = search_for_papers(query, result_limit=5)
+    except InferenceError:
+        raise
     except Exception:
         print("EXCEPTION in get_citation_addition (initial search):")
         print(traceback.format_exc())
@@ -518,6 +525,8 @@ This JSON will be automatically parsed, so ensure the format is precise."""
         else:
             return None, False
 
+    except InferenceError:
+        raise
     except Exception:
         print("EXCEPTION in get_citation_addition (selecting papers):")
         print(traceback.format_exc())
@@ -592,7 +601,7 @@ Ensure you are always writing good compilable LaTeX code. Common mistakes that s
 - Do not hallucinate new citations or any results not in the logs.
 
 Ensure proper citation usage:
-- Always include references within \begin{{filecontents}}{{references.bib}} ... \end{{filecontents}}, even if they haven't changed from the previous round.
+- Always include references within \\begin{{filecontents}}{{references.bib}} ... \\end{{filecontents}}, even if they haven't changed from the previous round.
 - Use citations from the provided references.bib content.
 - Each section (especially Related Work) should have multiple citations.
 
@@ -788,7 +797,7 @@ def gather_citations(base_folder, num_cite_rounds=20, small_model="gpt-4o-2024-0
         filtered_summaries_str = json.dumps(filtered_summaries, indent=2)
 
         # Run small model for citation additions
-        client, client_model = create_client(small_model)
+        client, client_model = create_client(small_model, role="citation")
 
         for round_idx in range(current_round, num_cite_rounds):
             try:
@@ -836,6 +845,17 @@ def gather_citations(base_folder, num_cite_rounds=20, small_model="gpt-4o-2024-0
                                     f,
                                 )
 
+            except InferenceError:
+                # Do not mark a quota/authentication failure as a bad citation
+                # round or consume the remaining citation budget.
+                with open(citations_cache_path, "w") as f:
+                    f.write(citations_text)
+                with open(progress_path, "w") as f:
+                    json.dump(
+                        {"completed_rounds": round_idx, "status": "inference_failed"},
+                        f,
+                    )
+                raise
             except Exception as e:
                 print(f"Error in citation round {round_idx}: {e}")
                 print(traceback.format_exc())
@@ -848,6 +868,8 @@ def gather_citations(base_folder, num_cite_rounds=20, small_model="gpt-4o-2024-0
 
         return citations_text if citations_text else None
 
+    except InferenceError:
+        raise
     except Exception:
         print("EXCEPTION in gather_citations:")
         print(traceback.format_exc())
@@ -950,7 +972,7 @@ def perform_writeup(
 
         # Generate VLM-based descriptions
         try:
-            vlm_client, vlm_model = create_vlm_client(small_model)
+            vlm_client, vlm_model = create_vlm_client(small_model, role="writing_vision")
             desc_map = {}
             for pf in plot_names:
                 ppath = osp.join(figures_dir, pf)
@@ -973,6 +995,8 @@ def perform_writeup(
                 desc_text = desc_map.get(fname, "No description found")
                 plot_descriptions_list.append(f"{fname}: {desc_text}")
             plot_descriptions_str = "\n".join(plot_descriptions_list)
+        except InferenceError:
+            raise
         except Exception:
             print("EXCEPTION in VLM figure description generation:")
             print(traceback.format_exc())
@@ -981,7 +1005,7 @@ def perform_writeup(
         big_model_system_message = writeup_system_message_template.format(
             page_limit=page_limit
         )
-        big_client, big_client_model = create_client(big_model)
+        big_client, big_client_model = create_client(big_model, role="writing")
         with open(writeup_file, "r") as f:
             writeup_text = f.read()
 
@@ -1008,6 +1032,11 @@ def perform_writeup(
         updated_latex_code = latex_code_match.group(1).strip()
         with open(writeup_file, "w") as f:
             f.write(updated_latex_code)
+
+        # Also support zero reflection rounds without an undefined PDF path.
+        reflection_pdf = pdf_file
+        if n_writeup_reflections <= 0:
+            compile_latex(latex_folder, reflection_pdf)
 
         # Multiple reflection loops on the final LaTeX
         for i in range(n_writeup_reflections):
@@ -1078,7 +1107,7 @@ Return the entire file in full, with no unfilled placeholders!
 This must be an acceptable complete LaTeX writeup.
 Do not hallucinate any details!
 Ensure proper citation usage:
-- Always include references within \begin{{filecontents}}{{references.bib}} ... \end{{filecontents}}, even if they haven't changed from the previous round.
+- Always include references within \\begin{{filecontents}}{{references.bib}} ... \\end{{filecontents}}, even if they haven't changed from the previous round.
 - Use citations from the provided references.bib content.
 """
 
@@ -1192,7 +1221,7 @@ If you believe you are done with reflection, simply say: "I am done"."""
         # Get new reflection_page_info
         reflection_page_info = get_reflection_page_info(reflection_pdf, page_limit)
 
-        final_reflection_prompt = """{reflection_page_info}
+        final_reflection_prompt = f"""{reflection_page_info}
 USE MINIMAL EDITS TO OPTIMIZE THE PAGE LIMIT USAGE."""
         reflection_response, msg_history = get_response_from_llm(
             prompt=final_reflection_prompt,
@@ -1209,7 +1238,8 @@ USE MINIMAL EDITS TO OPTIMIZE THE PAGE LIMIT USAGE."""
         # Compile current version before reflection
         print(f"[green]Compiling PDF for reflection final page limit...[/green]")
 
-        print(f"reflection step {i+1}")
+        with open(writeup_file, "r") as f:
+            current_latex = f.read()
 
         reflection_code_match = re.search(
             r"```latex(.*?)```", reflection_response, re.DOTALL
@@ -1230,19 +1260,23 @@ USE MINIMAL EDITS TO OPTIMIZE THE PAGE LIMIT USAGE."""
                 with open(writeup_file, "w") as fo:
                     fo.write(final_text)
 
-                compile_latex(latex_folder, reflection_pdf)
             else:
                 print(f"No changes in reflection page step.")
 
+        # A valid existing writeup remains valid when the model reports no
+        # changes; always publish the final-page-limit artifact.
+        compile_latex(latex_folder, reflection_pdf)
         return osp.exists(reflection_pdf)
 
+    except InferenceError:
+        raise
     except Exception:
         print("EXCEPTION in perform_writeup:")
         print(traceback.format_exc())
         return False
 
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Perform writeup for a project")
     parser.add_argument("--folder", type=str, help="Project folder", required=True)
     parser.add_argument("--no-writing", action="store_true", help="Only generate")
@@ -1251,14 +1285,12 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default="bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
-        choices=AVAILABLE_LLMS,
         help="Model to use for citation collection (small model).",
     )
     parser.add_argument(
         "--big-model",
         type=str,
         default="o1-2024-12-17",
-        choices=AVAILABLE_LLMS,
         help="Model to use for final writeup (big model).",
     )
     parser.add_argument(
@@ -1273,9 +1305,18 @@ if __name__ == "__main__":
         default=4,
         help="Target page limit for the main paper (excluding references).",
     )
-    args = parser.parse_args()
+    add_inference_arguments(parser)
+    parser.set_defaults(
+        _inference_model_roles={
+            "model": ["citation", "writing_vision"],
+            "big_model": ["writing"],
+        }
+    )
+    args = parser.parse_args(argv)
 
     try:
+        runtime = configure_from_args(args, artifact_dir=args.folder, argv=argv)
+        runtime.preflight()
         success = perform_writeup(
             base_folder=args.folder,
             no_writing=args.no_writing,
@@ -1287,6 +1328,16 @@ if __name__ == "__main__":
         )
         if not success:
             print("Writeup process did not complete successfully.")
+        return 0 if success else 1
+    except InferenceError:
+        raise
     except Exception:
         print("EXCEPTION in main:")
         print(traceback.format_exc())
+        return 1
+    finally:
+        shutdown_inference()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

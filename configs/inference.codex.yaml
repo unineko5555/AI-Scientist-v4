@@ -1,0 +1,23 @@
+# Use only the official Codex CLI with a ChatGPT subscription login.
+inference:
+  mode: cli
+  subscription_only: true
+  default:
+    backend: codex_cli
+    model: null  # Omit --model and use the CLI default. Set explicitly if needed.
+  providers:
+    codex_cli:
+      executable: codex
+      max_in_flight: 1
+      max_input_text_bytes: 524288
+      max_materialized_bytes: 33554432
+  history_mode: explicit_stateless
+  unsupported_parameter_policy: warn_and_record
+  overflow_policy: error
+  fallback: none
+  queue_timeout_seconds: 3600
+  request_timeout_seconds: 1800
+  transient_retry_limit: 2
+  schema_repair_limit: 1
+  max_queue_size: 64
+  max_payload_bytes: 33554432

@@ -1,18 +1,28 @@
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import CancelledError, wait
+from collections import Counter
 from typing import List, Optional, Set, Any, Callable, cast, Dict, Tuple
 import random
 import subprocess
 import os
+import json
+import multiprocessing
+import signal
+import threading
+import time
+import uuid
 from queue import Queue
 import logging
 import humanize
 from .backend import FunctionSpec, compile_prompt_to_md, query
-from .interpreter import ExecutionResult
+from .interpreter import ExecutionResult, _process_identity, stop_owned_sessions, stop_owned_workers
 from .journal import Journal, Node
 from .utils import data_preview
 from .utils.config import Config
 from .utils.metric import MetricValue, WorstMetricValue
 from .utils.response import extract_code, extract_text_up_to_code, wrap_code
+from .utils.owned_pool import CancellationFlag, OwnedProcessPool
+from ai_scientist.inference import get_runtime
+from ai_scientist.inference.errors import Cancelled, InferenceError, InvalidStructuredOutput
 import copy
 import pickle
 from dataclasses import asdict
@@ -26,6 +36,108 @@ import sys
 logger = logging.getLogger("ai-scientist")
 
 ExecCallbackType = Callable[[str, bool], ExecutionResult]
+_WORKER_CANCEL_EVENT = None
+_WORKER_OWNERSHIP_DIR = None
+
+
+def _initialize_tree_worker(cancel_event, inference_environment, ownership_dir):
+    """Attach to the parent's broker; never construct another broker in a worker."""
+    global _WORKER_CANCEL_EVENT, _WORKER_OWNERSHIP_DIR
+    _WORKER_CANCEL_EVENT = cancel_event
+    _WORKER_OWNERSHIP_DIR = Path(ownership_dir) / "interpreters"
+    workers_dir = Path(ownership_dir) / "workers"
+    workers_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    workers_dir.chmod(0o700)
+    identity = _process_identity(os.getpid())
+    if identity is None or identity.get("uid") != os.getuid():
+        raise RuntimeError("Cannot establish precise owned worker identity")
+    record = workers_dir / f"{os.getpid()}.json"
+    temporary = record.with_suffix(".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        temporary.chmod(0o600)
+        json.dump({"version": 1, "pid": os.getpid(), "identity": identity}, handle)
+    temporary.replace(record)
+    os.environ.update(inference_environment)
+    # The parent handles Ctrl+C and communicates cancellation through the Event.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    get_runtime()
+
+
+def _check_worker_cancelled():
+    if _WORKER_CANCEL_EVENT is not None and _WORKER_CANCEL_EVENT.is_set():
+        raise Cancelled("Tree batch cancelled; partial experiment artifacts retained")
+
+
+def _retain_interpreter_result(node, interpreter, phase):
+    result = getattr(interpreter, "last_result", None)
+    if node is None or result is None:
+        return
+    if phase == "experiment_execution":
+        node.absorb_exec_result(result)
+    elif phase == "plot_execution":
+        node.absorb_plot_exec_result(result)
+    elif phase == "metric_execution":
+        node.parse_term_out = result.term_out
+        node.parse_exc_type = result.exc_type
+        node.parse_exc_info = result.exc_info
+        node.parse_exc_stack = result.exc_stack
+
+
+def _save_partial_node(cfg, workspace, child_node, phase, error=None, *, completed=False):
+    """Inference-free worker snapshot, including work not returned to the parent."""
+    node_id = child_node.id if child_node is not None else f"worker_{os.getpid()}"
+    destination = Path(cfg.log_dir) / ("completed_nodes" if completed else "partial_nodes")
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination.chmod(0o700)
+    path = destination / f"{node_id}.json"
+    payload = {
+        "schema_version": 1,
+        "status": "completed" if completed else "incomplete",
+        "phase": phase,
+        "node": child_node.to_dict() if child_node is not None else None,
+        "workspace": str(Path(workspace).resolve()),
+        "artifacts": sorted(str(p.resolve()) for p in Path(workspace).rglob("*") if p.is_file()),
+        "error": {"type": type(error).__name__, "message": str(error)} if error else None,
+    }
+    temporary = path.with_suffix(".json.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        temporary.chmod(0o600)
+        json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+    temporary.replace(path)
+    if completed:
+        (Path(cfg.log_dir) / "partial_nodes" / f"{node_id}.json").unlink(missing_ok=True)
+    return str(path)
+
+
+def _selected_plot_paths(candidates, selected):
+    """A model may reorder candidate occurrences, but cannot invent local paths."""
+    available = Counter(str(Path(path).resolve()) for path in candidates)
+    if not isinstance(selected, list) or not 1 <= len(selected) <= 10:
+        raise InvalidStructuredOutput("Plot selection must contain 1 to 10 candidate paths")
+    result = []
+    for path in selected:
+        if not isinstance(path, str):
+            raise InvalidStructuredOutput("Selected plot paths must be strings")
+        resolved = str(Path(path).resolve())
+        if available[resolved] <= 0 or not Path(resolved).is_file():
+            raise InvalidStructuredOutput("Selected plot is not an available candidate occurrence")
+        available[resolved] -= 1
+        result.append(path)
+    return result
+
+
+def _plot_data_url(path):
+    from PIL import Image
+
+    try:
+        with Image.open(path) as image:
+            media_type = Image.MIME.get(image.format)
+        data = Path(path).read_bytes()
+    except (OSError, ValueError) as error:
+        raise InvalidStructuredOutput(f"Cannot read experimental plot: {path}") from error
+    if media_type not in {"image/png", "image/jpeg", "image/gif", "image/webp"}:
+        raise InvalidStructuredOutput(f"Unsupported experimental plot image type: {media_type}")
+    return f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
 def _safe_pickle_test(obj, name="object"):
@@ -659,7 +771,9 @@ class MinimalAgent:
         """Generate a natural language plan + code in the same LLM call and split them apart."""
         completion_text = None
         for _ in range(retries):
+            _check_worker_cancelled()
             completion_text = query(
+                role="experiment_code",
                 system_message=prompt,
                 user_message=None,
                 model=self.cfg.agent.code.model,
@@ -686,6 +800,7 @@ class MinimalAgent:
         logger.info(f"Agent is parsing execution results for node {node.id}")
 
         node.absorb_exec_result(exec_result)
+        _check_worker_cancelled()
 
         prompt = {
             "Introduction": (
@@ -701,6 +816,7 @@ class MinimalAgent:
         response = cast(
             dict,
             query(
+                role="execution_feedback",
                 system_message=prompt,
                 user_message=None,
                 func_spec=review_func_spec,
@@ -852,7 +968,9 @@ class MinimalAgent:
         retry_count = 0
         retry_limit = 5
         while retry_count < retry_limit:
+            _check_worker_cancelled()
             response = query(
+                role="execution_feedback",
                 system_message=determine_prompt,
                 user_message=None,
                 model=self.cfg.agent.feedback.model,
@@ -893,19 +1011,12 @@ class MinimalAgent:
 
     def _analyze_plots_with_vlm(self, node: Node) -> None:
         """Analyze experimental plots using VLM"""
+        _check_worker_cancelled()
         if not node.plot_paths:
             return
 
         # for debugging
         print(f"[cyan]Plot paths:[/cyan] {node.plot_paths}")
-
-        def encode_image_to_base64(image_path):
-            with open(image_path, "rb") as image_file:
-                try:
-                    return base64.b64encode(image_file.read()).decode("utf-8")
-                except Exception as e:
-                    print(f"[red]Error encoding image {image_path}: {e}[/red]")
-                    return None
 
         if not len(node.plot_paths) > 10:
             selected_plots = node.plot_paths
@@ -925,59 +1036,20 @@ class MinimalAgent:
                 "Plot paths": node.plot_paths,
             }
 
-            try:
-                response_select_plots = cast(
-                    dict,
-                    query(
-                        system_message=prompt_select_plots,
-                        user_message=None,
-                        func_spec=plot_selection_spec,
-                        model=self.cfg.agent.feedback.model,
-                        temperature=self.cfg.agent.feedback.temp,
-                    ),
-                )
-
-                print(f"[cyan]Plot selection response:[/cyan] {response_select_plots}")
-                # Extract the plot paths list
-                selected_plots = response_select_plots.get("selected_plots", [])
-
-                # Validate that all paths exist and are image files
-                valid_plots = []
-                for plot_path in selected_plots:
-                    if (
-                        isinstance(plot_path, str)
-                        and os.path.exists(plot_path)
-                        and plot_path.lower().endswith((".png", ".jpg", ".jpeg"))
-                    ):
-                        valid_plots.append(plot_path)
-                    else:
-                        logger.warning(f"Invalid plot path received: {plot_path}")
-
-                # Use the validated list
-                if valid_plots:
-                    print(f"[cyan]Selected valid plots:[/cyan] {valid_plots}")
-                    selected_plots = valid_plots
-                else:
-                    logger.warning(
-                        "No valid plot paths found in response, falling back to first 10 plots"
-                    )
-                    # fallback to first 10 plots
-                    # validate node.plot_paths
-                    selected_plots = []
-                    for plot_path in node.plot_paths[:10]:
-                        if os.path.exists(plot_path) and plot_path.lower().endswith(
-                            (".png", ".jpg", ".jpeg")
-                        ):
-                            selected_plots.append(plot_path)
-                        else:
-                            logger.warning(f"Invalid plot path received: {plot_path}")
-
-            except Exception as e:
-                logger.error(
-                    f"Error in plot selection: {str(e)}; falling back to first 10 plots"
-                )
-                # Fallback to using first 10 plots
-                selected_plots = node.plot_paths[:10]
+            response_select_plots = cast(
+                dict,
+                query(
+                    role="execution_feedback",
+                    system_message=prompt_select_plots,
+                    user_message=None,
+                    func_spec=plot_selection_spec,
+                    model=self.cfg.agent.feedback.model,
+                    temperature=self.cfg.agent.feedback.temp,
+                ),
+            )
+            selected_plots = _selected_plot_paths(
+                node.plot_paths, response_select_plots.get("selected_plots")
+            )
 
         print("[cyan]Before encoding images[/cyan]")
         user_message = [
@@ -998,7 +1070,7 @@ class MinimalAgent:
             {
                 "type": "image_url",
                 "image_url": {
-                    "url": f"data:image/jpeg;base64,{encode_image_to_base64(plot_path)}"
+                    "url": _plot_data_url(plot_path)
                 },
             }
             for plot_path in selected_plots
@@ -1007,6 +1079,7 @@ class MinimalAgent:
         response = cast(
             dict,
             query(
+                role="experiment_vision",
                 system_message=None,
                 user_message=user_message,
                 func_spec=vlm_feedback_spec,
@@ -1017,13 +1090,16 @@ class MinimalAgent:
         print(
             f"[cyan]VLM response from {self.cfg.agent.vlm_feedback.model}:[/cyan] {response}"
         )
+        analyses = response["plot_analyses"]
+        if (response["valid_plots_received"] or analyses) and len(analyses) != len(selected_plots):
+            raise InvalidStructuredOutput("VLM analysis count does not match selected plot occurrences")
         if response["valid_plots_received"]:
             node.is_buggy_plots = False
         else:
             node.is_buggy_plots = True
 
         for index, analysis in enumerate(response["plot_analyses"]):
-            analysis["plot_path"] = node.plot_paths[index]
+            analysis["plot_path"] = selected_plots[index]
 
         node.plot_analyses = response["plot_analyses"]
         node.vlm_feedback_summary = response["vlm_feedback_summary"]
@@ -1058,6 +1134,7 @@ class MinimalAgent:
         return cast(
             dict,
             query(
+                role="summary",
                 system_message=summary_prompt,
                 user_message=None,
                 func_spec={
@@ -1179,11 +1256,25 @@ class ParallelAgent:
             self.num_workers = min(self.num_workers, self.num_gpus)
             logger.info(f"Limiting workers to {self.num_workers} to match GPU count")
 
-        self.timeout = self.cfg.exec.timeout
-        self.executor = ProcessPoolExecutor(max_workers=self.num_workers)
         self._is_shutdown = False
+        self._batch_failure = None
+        self._cancel_started = None
+        self._owned_process_dir = Path(cfg.log_dir) / "owned_experiments" / uuid.uuid4().hex
+        self._cancel_lock = threading.Lock()
+        runtime = get_runtime()
+        runtime.ensure_started()
         # Define the metric once at initialization
         self.evaluation_metrics = self._define_global_metrics()
+        context = multiprocessing.get_context("spawn")
+        self._cancel_event = CancellationFlag(self._owned_process_dir / "cancel.flag")
+        self.executor = OwnedProcessPool(
+            max_workers=self.num_workers,
+            mp_context=context,
+            directory=self._owned_process_dir / "jobs",
+            function=self._process_node_wrapper,
+            initializer=_initialize_tree_worker,
+            initargs=(self._cancel_event, runtime.export_environment(), str(self._owned_process_dir)),
+        )
         self._ablation_state = {  # store ablation names
             "completed_ablations": set(),
         }
@@ -1212,6 +1303,7 @@ class ParallelAgent:
         }
 
         response = query(
+            role="experiment_code",
             system_message=prompt,
             user_message=None,
             model=self.cfg.agent.code.model,
@@ -1226,6 +1318,7 @@ class ParallelAgent:
         completion_text = None
         for _ in range(retries):
             completion_text = query(
+                role="experiment_code",
                 system_message=prompt,
                 user_message=None,
                 model=self.cfg.agent.code.model,
@@ -1263,17 +1356,20 @@ class ParallelAgent:
         Returns a list of nodes with different random seeds."""
 
         # Convert node to dict for parallel processing
-        node_data = node.to_dict()
+        base_node_data = node.to_dict()
         node_code = node.code
 
         # Submit parallel jobs for different seeds
-        seed_nodes = []
         futures = []
+        process_ids = []
         for seed in range(self.cfg.agent.multi_seed_eval.num_seeds):
+            if self._cancel_event.is_set():
+                break
+            node_data = copy.deepcopy(base_node_data)
+            process_id = f"seed_{seed}_worker"
             gpu_id = None
             if self.gpu_manager is not None:
                 try:
-                    process_id = f"seed_{seed}_worker"
                     gpu_id = self.gpu_manager.acquire_gpu(process_id)
                     logger.info(f"Assigned GPU {gpu_id} to seed {seed}")
                 except RuntimeError as e:
@@ -1295,8 +1391,8 @@ class ParallelAgent:
             seed_eval = True
             memory_summary = ""
             print("[yellow]Starting multi-seed eval...[/yellow]")
-            futures.append(
-                self.executor.submit(
+            try:
+                future = self.executor.submit(
                     self._process_node_wrapper,
                     node_data,
                     self.task_desc,
@@ -1307,27 +1403,23 @@ class ParallelAgent:
                     self.stage_name,
                     new_ablation_idea,
                     new_hyperparam_idea,
-                    best_stage1_plot_code,
-                    best_stage2_plot_code,
                     best_stage3_plot_code,
+                    best_stage2_plot_code,
+                    best_stage1_plot_code,
                     seed_eval,
                 )
-            )
+            except BaseException as error:
+                if self.gpu_manager is not None:
+                    self.gpu_manager.release_gpu(process_id)
+                self._request_batch_cancel(
+                    Cancelled("Experiment interrupted by user") if isinstance(error, KeyboardInterrupt) else error
+                )
+                break
+            futures.append(future)
+            process_ids.append(process_id)
+            futures[-1].add_done_callback(self._observe_worker_failure)
 
-        for future in futures:
-            try:
-                result_data = future.result(timeout=self.timeout)
-                result_node = Node.from_dict(result_data, self.journal)
-                print(f"Parent node id: {result_node.parent.id}")
-                print(f"Sanity check: actual parent node id: {node.id}")
-                # Add node to journal's list and assign its step number
-                self.journal.append(result_node)
-                seed_nodes.append(self.journal.get_node_by_id(result_node.id))
-                print("Added result node to journal")
-            except Exception as e:
-                logger.error(f"Error in multi-seed evaluation: {str(e)}")
-
-        return seed_nodes
+        return self._collect_results(futures, process_ids, update_state=False)
 
     def _run_plot_aggregation(self, node: Node, seed_nodes: List[Node]) -> Node:
         """Generate an aggregation node for seed evaluation results"""
@@ -1352,11 +1444,14 @@ class ParallelAgent:
                     format_tb_ipython=self.cfg.exec.format_tb_ipython,
                     agent_file_name=self.cfg.exec.agent_file_name,
                     env_vars={"AI_SCIENTIST_ROOT": os.getenv("AI_SCIENTIST_ROOT")},
+                    ownership_dir=self._owned_process_dir / "interpreters",
+                    subscription_only=get_runtime().is_cli,
                 )
 
                 try:
                     working_dir = process_interpreter.working_dir
                     plot_exec_result = process_interpreter.run(agg_plotting_code, True)
+                    agg_node.absorb_plot_exec_result(plot_exec_result)
                     print(plot_exec_result)
                     process_interpreter.cleanup_session()
                     # Save aggregated plots
@@ -1365,13 +1460,7 @@ class ParallelAgent:
                     if plots_dir.exists():
                         base_dir = Path(self.cfg.workspace_dir).parent  # .parent
                         run_name = Path(self.cfg.workspace_dir).name
-                        exp_results_dir = (
-                            base_dir
-                            / "logs"
-                            / run_name
-                            / "experiment_results"
-                            / f"seed_aggregation_{agg_node.id}"
-                        )
+                        exp_results_dir = Path(self.cfg.log_dir) / "experiment_results" / f"seed_aggregation_{agg_node.id}"
                         print("[red]exp_results_dir[/red]", exp_results_dir)
                         exp_results_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1403,6 +1492,8 @@ class ParallelAgent:
                     if process_interpreter:
                         process_interpreter.cleanup_session()
 
+            except InferenceError:
+                raise
             except Exception as e:
                 print(f"Error in seed result aggregation: {str(e)}")
 
@@ -1463,9 +1554,15 @@ class ParallelAgent:
             timeout=cfg.exec.timeout,
             format_tb_ipython=cfg.exec.format_tb_ipython,
             agent_file_name=cfg.exec.agent_file_name,
+            cancel_event=_WORKER_CANCEL_EVENT,
+            ownership_dir=_WORKER_OWNERSHIP_DIR,
+            subscription_only=get_runtime().is_cli,
         )
 
+        child_node = None
+        phase = "generation"
         try:
+            _check_worker_cancelled()
             print(f"stage_name: {stage_name}")
             # Recreate node object from node_data, which becomes a parent node.
             if node_data:
@@ -1523,10 +1620,18 @@ class ParallelAgent:
 
             # Execute and parse results
             print("Running code")
+            phase = "experiment_execution"
+            _check_worker_cancelled()
+            _save_partial_node(cfg, workspace, child_node, phase)
             exec_result = process_interpreter.run(child_node.code, True)
+            # Persistable execution data must precede any model request.
+            child_node.absorb_exec_result(exec_result)
             process_interpreter.cleanup_session()
+            _check_worker_cancelled()
 
             print("Parsing execution results")
+            phase = "execution_feedback"
+            _save_partial_node(cfg, workspace, child_node, phase)
             worker_agent.parse_exec_result(
                 node=child_node, exec_result=exec_result, workspace=working_dir
             )
@@ -1552,6 +1657,9 @@ class ParallelAgent:
                     child_node.parse_metrics_plan = parse_metrics_plan
                 else:
                     # Call LLM to parse data files and extract metrics
+                    phase = "metric_code"
+                    _check_worker_cancelled()
+                    _save_partial_node(cfg, workspace, child_node, phase)
                     parse_metrics_prompt = {
                         "Introduction": (
                             "You are an AI researcher analyzing experimental results stored in numpy files. "
@@ -1594,6 +1702,9 @@ class ParallelAgent:
                     child_node.parse_metrics_code = parse_metrics_code
                 try:
                     # Execute the parsing code
+                    phase = "metric_execution"
+                    _check_worker_cancelled()
+                    _save_partial_node(cfg, workspace, child_node, phase)
                     metrics_exec_result = process_interpreter.run(
                         parse_metrics_code, True
                     )
@@ -1602,6 +1713,7 @@ class ParallelAgent:
                     child_node.parse_exc_type = metrics_exec_result.exc_type
                     child_node.parse_exc_info = metrics_exec_result.exc_info
                     child_node.parse_exc_stack = metrics_exec_result.exc_stack
+                    _check_worker_cancelled()
 
                     if metrics_exec_result.exc_type is None:
                         # Extract metrics from the execution output
@@ -1616,9 +1728,12 @@ class ParallelAgent:
                             f"[blue]Metrics Parsing Execution Result:\n[/blue] {metrics_exec_result}"
                         )
 
+                        phase = "metric_evaluation"
+                        _save_partial_node(cfg, workspace, child_node, phase)
                         metrics_response = cast(
                             dict,
                             query(
+                                role="execution_feedback",
                                 system_message=metrics_prompt,
                                 user_message=None,
                                 func_spec=metric_parse_spec,
@@ -1651,6 +1766,8 @@ class ParallelAgent:
                         child_node.metric = WorstMetricValue()
                         child_node.is_buggy = True
 
+                except InferenceError:
+                    raise
                 except Exception as e:
                     logger.error(
                         f"Error parsing metrics for node {child_node.id}: {str(e)}"
@@ -1670,6 +1787,9 @@ class ParallelAgent:
                 try:
                     retry_count = 0
                     while True:
+                        phase = "plot_generation"
+                        _check_worker_cancelled()
+                        _save_partial_node(cfg, workspace, child_node, phase)
                         if seed_eval:
                             # Use the parent node's plotting code instead of generating new one
                             plotting_code = parent_node.plot_code
@@ -1692,9 +1812,12 @@ class ParallelAgent:
                             plotting_code = worker_agent._generate_plotting_code(
                                 child_node, working_dir, plot_code_from_prev_stage
                             )
+                        phase = "plot_execution"
+                        _save_partial_node(cfg, workspace, child_node, phase)
                         plot_exec_result = process_interpreter.run(plotting_code, True)
+                        child_node.absorb_plot_exec_result(plot_exec_result)
                         process_interpreter.cleanup_session()
-                        child_node.plot_exec_result = plot_exec_result
+                        _check_worker_cancelled()
                         if child_node.plot_exc_type and retry_count < 3:
                             print(
                                 f"[red]Plotting code failed with exception: {child_node.plot_exc_type}[/red]"
@@ -1718,13 +1841,7 @@ class ParallelAgent:
                         # Save the plotting code first
                         base_dir = Path(cfg.workspace_dir).parent
                         run_name = Path(cfg.workspace_dir).name
-                        exp_results_dir = (
-                            base_dir
-                            / "logs"
-                            / run_name
-                            / "experiment_results"
-                            / f"experiment_{child_node.id}_proc_{os.getpid()}"
-                        )
+                        exp_results_dir = Path(cfg.log_dir) / "experiment_results" / f"experiment_{child_node.id}_proc_{os.getpid()}"
                         child_node.exp_results_dir = exp_results_dir
                         exp_results_dir.mkdir(parents=True, exist_ok=True)
                         plot_code_path = exp_results_dir / "plotting_code.py"
@@ -1764,6 +1881,8 @@ class ParallelAgent:
                             )
                             logger.debug(f"Plot absolute path: {final_path.absolute()}")
                             logger.debug(f"Plot web path: {web_path}")
+                except InferenceError:
+                    raise
                 except Exception as e:
                     logger.error(
                         f"Error generating plots for node {child_node.id}: {str(e)}"
@@ -1771,10 +1890,14 @@ class ParallelAgent:
 
                 if child_node.plots:
                     try:
+                        phase = "plot_evaluation"
+                        _save_partial_node(cfg, workspace, child_node, phase)
                         worker_agent._analyze_plots_with_vlm(child_node)
                         logger.info(
                             f"Generated VLM analysis for plots in node {child_node.id}"
                         )
+                    except InferenceError:
+                        raise
                     except Exception as e:
                         logger.error(
                             f"Error analyzing plots for node {child_node.id}: {str(e)}"
@@ -1783,17 +1906,32 @@ class ParallelAgent:
             # Convert result node to dict
             print("Converting result to dict")
             result_data = child_node.to_dict()
+            _save_partial_node(cfg, workspace, child_node, "completed", completed=True)
             print(f"Result data keys: {result_data.keys()}")
             print(f"Result data size: {len(str(result_data))} chars")
             print("Returning result")
             return result_data
 
+        except InferenceError as error:
+            # Keep flags genuinely undecided on infrastructure failure. This
+            # snapshot is not appended to the scientific Journal as a failure.
+            _retain_interpreter_result(child_node, process_interpreter, phase)
+            snapshot = _save_partial_node(cfg, workspace, child_node, phase, error)
+            error.metadata["partial_node_path"] = snapshot
+            raise
         except Exception as e:
             print(f"Worker process error: {str(e)}")
             import traceback
 
+            # A startup/IPC/process failure is infrastructure, not scientific
+            # feedback. Preserve any already captured ExecutionResult without
+            # querying a model or changing the node's research flags.
+            _retain_interpreter_result(child_node, process_interpreter, phase)
+            _save_partial_node(cfg, workspace, child_node, phase, e)
             traceback.print_exc()
             raise
+        finally:
+            process_interpreter.cleanup_session()
 
     def _generate_hyperparam_tuning_idea(self) -> Optional[HyperparamTuningIdea]:
         """Generate the next hyperparam tuning idea based on what's been done.
@@ -1830,6 +1968,7 @@ class ParallelAgent:
         retry_limit = 5
         while retry_count < retry_limit:
             response = query(
+                role="experiment_code",
                 system_message=hyperparam_tuning_prompt,
                 user_message=None,
                 model=self.cfg.agent.code.model,
@@ -1893,6 +2032,7 @@ class ParallelAgent:
         retry_limit = 5
         while retry_count < retry_limit:
             response = query(
+                role="experiment_code",
                 system_message=ablation_prompt,
                 user_message=None,
                 model=self.cfg.agent.code.model,
@@ -2050,6 +2190,94 @@ class ParallelAgent:
 
         return nodes_to_process
 
+    def _request_batch_cancel(self, error):
+        with self._cancel_lock:
+            if self._batch_failure is not None:
+                return
+            self._batch_failure = error
+            self._cancel_started = time.monotonic()
+            self._cancel_event.set()
+        def cancel_inference():
+            try:
+                get_runtime().cancel_all(reason=str(error))
+            except Exception:
+                logger.exception("Could not cancel inference broker; retaining phase deadlines")
+
+        # Future callbacks execute on the result monitor. Broker IPC must never
+        # prevent it from collecting another worker's already durable result.
+        threading.Thread(target=cancel_inference, name="tree-inference-cancel", daemon=True).start()
+
+    def _finish_cancelled_batch(self, futures):
+        if getattr(self, "_cancel_reaped", False):
+            return
+        deadline = (self._cancel_started or time.monotonic()) + 5
+        while any(not future.done() for future in futures) and time.monotonic() < deadline:
+            try:
+                wait(futures, timeout=min(0.2, max(0, deadline - time.monotonic())))
+            except KeyboardInterrupt:
+                break
+        # No result Pipe is involved: shutdown collects committed files first,
+        # reaps the pool through owned public Process handles, and resolves all
+        # remaining Futures even if a writer died in a partial JSON file.
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        stop_owned_workers(self._owned_process_dir / "workers")
+        stop_owned_sessions(self._owned_process_dir / "interpreters")
+        self._cancel_reaped = True
+
+    def _observe_worker_failure(self, future):
+        if future.cancelled():
+            return
+        error = future.exception()
+        if error is not None:
+            self._request_batch_cancel(error)
+
+    def _collect_results(self, futures, process_ids, *, update_state=True):
+        """Keep V2 submission order and batch boundary even on partial failure.
+
+        The experiment timeout is enforced by Interpreter, not future.result:
+        queued inference and code execution are different clocks. A cancelled
+        batch is fully drained before GPU reservations can be reused.
+        """
+        result_nodes = []
+        for future, process_id in zip(futures, process_ids):
+            pool_failure = getattr(self.executor, "failure", None)
+            if pool_failure is not None:
+                self._request_batch_cancel(pool_failure)
+            while not future.done():
+                try:
+                    wait([future], timeout=0.2)
+                    pool_failure = getattr(self.executor, "failure", None)
+                    if pool_failure is not None:
+                        self._request_batch_cancel(pool_failure)
+                    if self._cancel_started is not None and time.monotonic() - self._cancel_started > 5:
+                        self._finish_cancelled_batch(futures)
+                except KeyboardInterrupt:
+                    self._request_batch_cancel(Cancelled("Experiment interrupted by user"))
+            try:
+                result_data = future.result()
+                result_node = Node.from_dict(result_data, self.journal)
+                if update_state:
+                    self._update_hyperparam_tuning_state(result_node)
+                    self._update_ablation_state(result_node)
+                self.journal.append(result_node)
+                result_nodes.append(result_node)
+            except CancelledError:
+                pass
+            except InferenceError as error:
+                self._request_batch_cancel(error)
+            except Exception as error:
+                self._request_batch_cancel(error)
+            finally:
+                # All owned work is stopped before any failed batch GPU is
+                # released, including workers that failed before their finally.
+                if self._batch_failure is not None:
+                    self._finish_cancelled_batch(futures)
+                if self.gpu_manager is not None:
+                    self.gpu_manager.release_gpu(process_id)
+        if self._batch_failure is not None:
+            raise self._batch_failure
+        return result_nodes
+
     def step(self, exec_callback: ExecCallbackType):
         print("Selecting nodes to process")
         nodes_to_process = self._select_parallel_nodes()
@@ -2082,51 +2310,28 @@ class ParallelAgent:
 
         print("Submitting tasks to process pool")
         futures = []
+        process_ids = []
         for node_data in node_data_list:
-            gpu_id = None
-            if self.gpu_manager is not None:
-                try:
-                    # Get current process ID for GPU assignment
-                    process_id = f"worker_{len(futures)}"
-                    gpu_id = self.gpu_manager.acquire_gpu(process_id)
-                    logger.info(f"Assigned GPU {gpu_id} to process {process_id}")
-                except RuntimeError as e:
-                    logger.warning(f"Could not acquire GPU: {e}. Running on CPU")
-
-            if (
-                self.stage_name
-                and self.stage_name.startswith("2_")
-                and node_data["is_buggy"] is False
-            ):
-                new_hyperparam_idea = self._generate_hyperparam_tuning_idea()
-                self._hyperparam_tuning_state["tried_hyperparams"].add(
-                    new_hyperparam_idea.name
-                )
-                new_ablation_idea = None
-            elif (
-                self.stage_name
-                and self.stage_name.startswith("4_")
-                and node_data["is_buggy"] is False
-            ):
-                new_ablation_idea = self._generate_ablation_idea()
-                self._ablation_state["completed_ablations"].add(new_ablation_idea.name)
-                new_hyperparam_idea = None
-            else:
+            if self._cancel_event.is_set():
+                break
+            process_id = f"worker_{len(futures)}"
+            try:
                 new_ablation_idea = None
                 new_hyperparam_idea = None
-
-            best_stage1_plot_code = (
-                self.best_stage1_node.plot_code if self.best_stage1_node else None
-            )
-            best_stage2_plot_code = (
-                self.best_stage2_node.plot_code if self.best_stage2_node else None
-            )
-            best_stage3_plot_code = (
-                self.best_stage3_node.plot_code if self.best_stage3_node else None
-            )
-            seed_eval = False
-            futures.append(
-                self.executor.submit(
+                if self.stage_name and node_data and node_data["is_buggy"] is False:
+                    if self.stage_name.startswith("2_"):
+                        new_hyperparam_idea = self._generate_hyperparam_tuning_idea()
+                        self._hyperparam_tuning_state["tried_hyperparams"].add(new_hyperparam_idea.name)
+                    elif self.stage_name.startswith("4_"):
+                        new_ablation_idea = self._generate_ablation_idea()
+                        self._ablation_state["completed_ablations"].add(new_ablation_idea.name)
+                gpu_id = None
+                if self.gpu_manager is not None:
+                    try:
+                        gpu_id = self.gpu_manager.acquire_gpu(process_id)
+                    except RuntimeError as error:
+                        logger.warning("Could not acquire GPU: %s. Running on CPU", error)
+                future = self.executor.submit(
                     self._process_node_wrapper,
                     node_data,
                     self.task_desc,
@@ -2137,57 +2342,25 @@ class ParallelAgent:
                     self.stage_name,
                     new_ablation_idea,
                     new_hyperparam_idea,
-                    best_stage1_plot_code,
-                    best_stage2_plot_code,
-                    best_stage3_plot_code,
-                    seed_eval,
+                    self.best_stage3_node.plot_code if self.best_stage3_node else None,
+                    self.best_stage2_node.plot_code if self.best_stage2_node else None,
+                    self.best_stage1_node.plot_code if self.best_stage1_node else None,
+                    False,
                 )
-            )
-
-        # Add results to journal
-        print("Waiting for results")
-        for i, future in enumerate(futures):
-            try:
-                print("About to get result from future")
-                result_data = future.result(timeout=self.timeout)
-                if "metric" in result_data:
-                    print(f"metric type: {type(result_data['metric'])}")
-                    print(f"metric contents: {result_data['metric']}")
-
-                # Create node and restore relationships using journal.
-                # Journal acts as a database to look up a parent node,
-                # and add the result node as a child.
-                result_node = Node.from_dict(result_data, self.journal)
-                print("[red]Investigating if result node has metric[/red]", flush=True)
-                print(result_node.metric)
-                # Update hyperparam tuning state if in Stage 2
-                self._update_hyperparam_tuning_state(result_node)
-                # Update ablation state if in Stage 4
-                self._update_ablation_state(result_node)
-
-                # Add node to journal's list and assign its step number
-                self.journal.append(result_node)
-                print("Added result node to journal")
-
-            except TimeoutError:
-                print("Worker process timed out, couldn't get the result")
-                logger.error(f"Worker process timed out, couldn't get the result")
-            except Exception as e:
-                print(f"Error processing node: {str(e)}")
-                logger.error(f"Error processing node: {str(e)}")
-                import traceback
-
-                traceback.print_exc()
-                raise
-            finally:
-                # Release GPU for this process if it was using one
-                process_id = f"worker_{i}"
-                if (
-                    self.gpu_manager is not None
-                    and process_id in self.gpu_manager.gpu_assignments
-                ):
+                futures.append(future)
+                process_ids.append(process_id)
+                future.add_done_callback(self._observe_worker_failure)
+            except BaseException as error:
+                # A parent-side inference failure can happen after earlier jobs
+                # were submitted; those jobs must still be stopped and saved.
+                if self.gpu_manager is not None and process_id not in process_ids:
                     self.gpu_manager.release_gpu(process_id)
-                    logger.info(f"Released GPU for process {process_id}")
+                self._request_batch_cancel(
+                    Cancelled("Experiment interrupted by user") if isinstance(error, KeyboardInterrupt) else error
+                )
+                break
+
+        self._collect_results(futures, process_ids)
 
     def _update_hyperparam_tuning_state(self, result_node: Node):
         """Update hyperparam tuning tracking state based on execution results."""
@@ -2312,15 +2485,12 @@ class ParallelAgent:
             "Plotting code guideline": prompt_guideline,
         }
         plotting_prompt["Instructions"] |= {
-            "Plotting code reference": (
-                "plotting code 1:\n" + seed_nodes[0].plot_code + "\n\n"
-                "plotting code 2:\n" + seed_nodes[1].plot_code + "\n\n"
-                "plotting code 3:\n" + seed_nodes[2].plot_code + "\n\n"
+            "Plotting code reference": "\n\n".join(
+                f"plotting code {index + 1}:\n{seed.plot_code or ''}"
+                for index, seed in enumerate(seed_nodes)
             ),
-            "Experiment Data Path": (
-                f"{seed_nodes[0].exp_results_dir}/experiment_data.npy\n"
-                f"{seed_nodes[1].exp_results_dir}/experiment_data.npy\n"
-                f"{seed_nodes[2].exp_results_dir}/experiment_data.npy\n"
+            "Experiment Data Path": "\n".join(
+                f"{seed.exp_results_dir}/experiment_data.npy" for seed in seed_nodes
             ),
         }
         plan, code = self.plan_and_code_query(plotting_prompt)
@@ -2338,29 +2508,19 @@ class ParallelAgent:
         if not self._is_shutdown:
             print("Shutting down parallel executor...")
             try:
-                # Release all GPUs
+                self._cancel_event.set()
+                self.executor.shutdown(wait=True, cancel_futures=True)
+                stop_owned_workers(self._owned_process_dir / "workers")
+                stop_owned_sessions(self._owned_process_dir / "interpreters")
                 if self.gpu_manager is not None:
-                    for process_id in list(self.gpu_manager.gpu_assignments.keys()):
+                    for process_id in list(self.gpu_manager.gpu_assignments):
                         self.gpu_manager.release_gpu(process_id)
-
-                # Shutdown executor first
-                self.executor.shutdown(wait=False, cancel_futures=True)
-
-                # Force terminate all worker processes
-                if self.executor._processes:
-                    ## Get copy of processes
-                    processes = list(self.executor._processes.values())
-
-                    # Then terminate processes if they're still alive
-                    for process in processes:
-                        if process.is_alive():
-                            process.terminate()
-                            process.join(timeout=1)
 
                 print("Executor shutdown complete")
 
             except Exception as e:
                 print(f"Error during executor shutdown: {e}")
+                raise
             finally:
                 self._is_shutdown = True
 

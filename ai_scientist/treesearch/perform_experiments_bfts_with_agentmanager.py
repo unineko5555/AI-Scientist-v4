@@ -1,8 +1,9 @@
-import atexit
 import logging
-import shutil
 import json
 import pickle
+from omegaconf import OmegaConf
+from ai_scientist.inference import configure_inference, get_runtime, shutdown_inference
+from ai_scientist.inference.errors import InferenceError
 from . import backend
 from .journal import Journal, Node
 from .journal2report import journal2report
@@ -55,10 +56,69 @@ def journal_to_rich_tree(journal: Journal, cfg):
     return tree
 
 
+def _write_tree_state(cfg, manager, status, error=None):
+    """Durable, inference-free manifest for completed and interrupted work."""
+    log_dir = Path(cfg.log_dir)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "status": status,
+        "last_stage": manager.current_stage.name if manager and manager.current_stage else None,
+        "completed_node_ids": {
+            name: [node.id for node in journal.nodes]
+            for name, journal in (manager.journals.items() if manager else [])
+        },
+        "pending_evaluations": sorted(str(path) for path in (log_dir / "partial_nodes").glob("*.json")),
+        "worker_completed_artifacts": sorted(str(path) for path in (log_dir / "completed_nodes").glob("*.json")),
+        "workspace": str(cfg.workspace_dir),
+        "stop_reason": {"type": type(error).__name__, "message": str(error)} if error else None,
+    }
+    target = log_dir / "tree_run_state.json"
+    temporary = target.with_suffix(".json.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        temporary.chmod(0o600)
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    temporary.replace(target)
+
+
 def perform_experiments_bfts(config_path: str):
-    # turn config path string into a path object
-    config_path = Path(config_path)
-    cfg = load_cfg(config_path)
+    cfg = load_cfg(Path(config_path))
+    # The launcher owns the shared runtime. Standalone tree runs may configure
+    # one from YAML; workers only ever attach to its exported environment.
+    from ai_scientist.inference import is_configured
+    owns_runtime = not is_configured()
+    if owns_runtime:
+        configure_inference(OmegaConf.to_container(cfg.inference, resolve=True), artifact_dir=cfg.log_dir)
+    runtime = get_runtime()
+    cfg.inference = runtime.export_config()
+    state = {"manager": None}
+    try:
+        runtime.ensure_started()
+        _perform_experiments_bfts(cfg, state)
+    except BaseException as error:
+        manager = state["manager"]
+        if manager:
+            for name, journal in manager.journals.items():
+                try:
+                    save_run(cfg, journal, stage_name=f"stage_{name}")
+                except Exception:
+                    logger.exception("Emergency journal snapshot failed for %s", name)
+        status = {
+            "QuotaExhausted": "stopped_quota",
+            "AuthenticationRequired": "stopped_auth",
+            "Cancelled": "cancelled",
+            "KeyboardInterrupt": "cancelled",
+        }.get(type(error).__name__, "failed_transport" if isinstance(error, InferenceError) else "failed")
+        _write_tree_state(cfg, manager, status, error)
+        raise
+    else:
+        _write_tree_state(cfg, state["manager"], "completed")
+    finally:
+        if owns_runtime:
+            shutdown_inference()
+
+
+def _perform_experiments_bfts(cfg, state):
     logger.info(f'Starting run "{cfg.exp_name}"')
 
     task_desc = load_task_desc(cfg)
@@ -70,17 +130,13 @@ def perform_experiments_bfts(config_path: str):
     with Status("Preparing agent workspace (copying and extracting files) ..."):
         prep_agent_workspace(cfg)
 
-    def cleanup():
-        if global_step == 0:
-            shutil.rmtree(cfg.workspace_dir)
-
-    atexit.register(cleanup)
-
     manager = AgentManager(
         task_desc=task_desc,
         cfg=cfg,
         workspace_dir=Path(cfg.workspace_dir),
     )
+    state["manager"] = manager
+    _write_tree_state(cfg, manager, "running")
 
     prog = Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -102,6 +158,9 @@ def perform_experiments_bfts(config_path: str):
 
     def step_callback(stage, journal):
         print("Step complete")
+        # Saving must precede summarization/best-node/model-dependent HTML.
+        save_run(cfg, journal, stage_name=f"stage_{stage.name}")
+        _write_tree_state(cfg, manager, "running")
         try:
             # Generate and save notes for this step
             notes_dir = cfg.log_dir / f"stage_{stage.name}" / "notes"
@@ -149,8 +208,10 @@ def perform_experiments_bfts(config_path: str):
                 json.dump(stage_summary, f, indent=2)
 
             # Save the run as before
-            save_run(cfg, journal, stage_name=f"stage_{stage.name}")
+            save_run(cfg, journal, stage_name=f"stage_{stage.name}", include_analysis=True)
 
+        except InferenceError:
+            raise
         except Exception as e:
             print(f"Error in step callback: {e}")
 
@@ -258,5 +319,4 @@ def perform_experiments_bfts(config_path: str):
 
 if __name__ == "__main__":
     cfg_path = "treesearch/utils/config.yaml"
-    cfg = load_cfg(cfg_path)
     perform_experiments_bfts(cfg_path)

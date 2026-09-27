@@ -1,33 +1,40 @@
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass
+import json
 
 import jsonschema
-from dataclasses_json import DataClassJsonMixin
+try:
+    from dataclasses_json import DataClassJsonMixin
+except ModuleNotFoundError as exc:
+    if exc.name != "dataclasses_json":
+        raise
+
+    class DataClassJsonMixin:
+        """Optional API/research-stack dependency; FunctionSpec is JSON-native."""
 
 PromptType = str | dict | list
 FunctionCallType = dict
 OutputType = str | FunctionCallType
 
 
-import backoff
 import logging
 from typing import Callable
 
 logger = logging.getLogger("ai-scientist")
 
 
-@backoff.on_predicate(
-    wait_gen=backoff.expo,
-    max_value=60,
-    factor=1.5,
-)
 def backoff_create(
     create_fn: Callable, retry_exceptions: list[Exception], *args, **kwargs
 ):
-    try:
+    # This dependency is only needed by the legacy API backends. CLI errors
+    # never enter this API retry loop.
+    import backoff
+
+    @backoff.on_exception(backoff.expo, retry_exceptions, max_value=60, factor=1.5)
+    def call():
         return create_fn(*args, **kwargs)
-    except retry_exceptions as e:
-        logger.info(f"Backoff exception: {e}")
-        return False
+
+    return call()
 
 
 def opt_messages_to_list(
@@ -112,6 +119,25 @@ class FunctionSpec(DataClassJsonMixin):
         # validate the schema
         jsonschema.Draft7Validator.check_schema(self.json_schema)
 
+    def validate(self, value):
+        """Validate the returned value, not only the schema definition."""
+        jsonschema.Draft7Validator(self.json_schema).validate(value)
+        return value
+
+    def to_dict(self):
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, value):
+        return cls(**deepcopy(value))
+
+    def to_json(self, **kwargs):
+        return json.dumps(self.to_dict(), **kwargs)
+
+    @classmethod
+    def from_json(cls, value, **kwargs):
+        return cls.from_dict(json.loads(value, **kwargs))
+
     @property
     def as_openai_tool_dict(self):
         return {
@@ -129,3 +155,20 @@ class FunctionSpec(DataClassJsonMixin):
             "type": "function",
             "function": {"name": self.name},
         }
+
+
+def coerce_function_spec(value):
+    """Accept the existing node-summary ``parameters`` dictionary contract."""
+    if value is None or isinstance(value, FunctionSpec):
+        return value
+    if not isinstance(value, dict):
+        raise TypeError("func_spec must be a FunctionSpec or function dictionary")
+    definition = value.get("function", value)
+    schema = definition.get("json_schema", definition.get("parameters"))
+    if schema is None or not definition.get("name"):
+        raise ValueError("Function specification requires name and parameters/json_schema")
+    return FunctionSpec(
+        name=definition["name"],
+        description=definition.get("description", ""),
+        json_schema=deepcopy(schema),
+    )

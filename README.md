@@ -29,6 +29,7 @@ This system autonomously generates hypotheses, runs experiments, analyzes data, 
 
 1.  [Requirements](#requirements)
     *   [Installation](#installation)
+    *   [Subscription CLI inference](#subscription-cli-inference)
     *   [Supported Models and API Keys](#supported-models-and-api-keys)
 2.  [Generate Research Ideas](#generate-research-ideas)
 3.  [Run AI Scientist-v2 Paper Generation Experiments](#run-ai-scientist-v2-paper-generation-experiments)
@@ -60,7 +61,32 @@ pip install -r requirements.txt
 
 Installation usually takes no more than one hour.
 
+### Subscription CLI inference
+
+The V2 research pipeline can now route its managed text and vision inference through the official Codex or Claude Code CLI. CLI mode requires a subscription login, blocks API fallback, and keeps the V2 experiment, plotting, writing, and review stages. The legacy API mode remains the default for existing commands.
+
+Install the desired official CLI and log in yourself using **ChatGPT** (`codex login`) or a **Claude subscription** (`claude auth login`, without `--console`). See the official [Codex authentication guide](https://developers.openai.com/codex/auth/) and [Claude CLI reference](https://code.claude.com/docs/en/cli-reference). Do not supply LLM API keys for CLI mode.
+
+```bash
+# Read-only version/capability/authentication checks; no model requests.
+python -m ai_scientist.inference.doctor --inference-config configs/inference.codex.yaml
+
+# Optional: three small live checks per backend/model; consumes subscription usage.
+python -m ai_scientist.inference.doctor --inference-config configs/inference.codex.yaml --probe
+
+# All managed LLM/VLM roles use Codex; keep the existing research dependencies.
+python launch_scientist_bfts.py \
+  --load_ideas ai_scientist/ideas/my_research_topic.json \
+  --inference-config configs/inference.codex.yaml
+```
+
+Use `configs/inference.claude.yaml` for Claude-only or `configs/inference.mixed.yaml` for explicit role-based routing. The same inference flags work with standalone ideation, plotting, and both writeup commands. A model of `null` uses the CLI default; legacy API model defaults are not passed to a CLI.
+
+This is **not offline execution or a guarantee of unlimited/free usage**: the CLI contacts its service, account usage limits still apply, and Semantic Scholar/data downloads remain separate network services. Small live probes do not establish full V2 parity. Long-context behavior, both providers' deployed isolation policies, and full GPU/PDF research runs still require acceptance testing. See [CLI setup, limits, diagnostics, and recovery](docs/cli-inference.md) and [implementation specification/status](development_memo.md).
+
 ### Supported Models and API Keys
+
+The following model-key instructions apply to legacy API mode, not subscription CLI mode.
 
 #### OpenAI Models
 

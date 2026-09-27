@@ -1,0 +1,21 @@
+# Offline inference-contract tests; no model credentials or GPU required.
+-r requirements-cli.txt
+numpy>=1.24
+pytest>=8,<10
+hypothesis>=6,<7
+# CPU-only imports for real workflow/--help/process smoke tests (no CUDA/TeX/model calls).
+backoff
+black
+coolname
+dataclasses-json
+funcy
+genson
+humanize
+omegaconf
+pandas
+psutil
+python-igraph
+requests
+rich
+shutup
+tqdm

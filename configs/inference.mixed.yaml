@@ -1,0 +1,25 @@
+# Both providers must be installed and subscription-authenticated.
+inference:
+  mode: cli
+  subscription_only: true
+  default:
+    backend: codex_cli
+    model: null
+  roles:
+    writing:
+      backend: claude_cli
+    writing_vision:
+      backend: claude_cli
+    review_text:
+      backend: claude_cli
+    review_vision:
+      backend: claude_cli
+  providers:
+    codex_cli:
+      executable: codex
+      max_in_flight: 1
+    claude_cli:
+      executable: claude
+      max_in_flight: 1
+  unsupported_parameter_policy: warn_and_record
+  fallback: none

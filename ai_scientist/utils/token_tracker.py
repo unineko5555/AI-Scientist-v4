@@ -1,10 +1,12 @@
 from functools import wraps
 from typing import Dict, Optional, List
-import tiktoken
+from dataclasses import asdict, is_dataclass
 from collections import defaultdict
 import asyncio
 from datetime import datetime
+import inspect
 import logging
+from threading import RLock
 
 
 class TokenTracker:
@@ -21,6 +23,9 @@ class TokenTracker:
             lambda: {"prompt": 0, "completion": 0, "reasoning": 0, "cached": 0}
         )
         self.interactions = defaultdict(list)
+        self.normalized_usage = []
+        self._seen_requests = set()
+        self._lock = RLock()
 
         self.MODEL_PRICES = {
             "gpt-4o-2024-11-20": {
@@ -67,10 +72,43 @@ class TokenTracker:
         reasoning_tokens: int,
         cached_tokens: int,
     ):
-        self.token_counts[model]["prompt"] += prompt_tokens
-        self.token_counts[model]["completion"] += completion_tokens
-        self.token_counts[model]["reasoning"] += reasoning_tokens
-        self.token_counts[model]["cached"] += cached_tokens
+        with self._lock:
+            self.token_counts[model]["prompt"] += prompt_tokens
+            self.token_counts[model]["completion"] += completion_tokens
+            self.token_counts[model]["reasoning"] += reasoning_tokens
+            self.token_counts[model]["cached"] += cached_tokens
+
+    def add_normalized_usage(self, backend, model, usage, *, request_id=None):
+        """Record provider-neutral usage without treating missing fields as zero.
+
+        This is a local view only. The run broker owns cross-process aggregation.
+        Subscription billing is not inferable from CLI usage or cost estimates.
+        """
+        if is_dataclass(usage):
+            usage = asdict(usage)
+        elif usage is not None and not isinstance(usage, dict):
+            usage = vars(usage)
+        usage = dict(usage or {})
+        record = {
+            "backend": backend,
+            "model": model,
+            "request_id": request_id,
+            "input_tokens": usage.get("input_tokens"),
+            "output_tokens": usage.get("output_tokens"),
+            "cached_input_tokens": usage.get("cached_input_tokens"),
+            "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+            "input_includes_cached": usage.get("input_includes_cached"),
+            "reasoning_tokens": usage.get("reasoning_tokens", usage.get("reasoning_output_tokens")),
+            "api_equivalent_cost_usd": usage.get("api_equivalent_cost_usd"),
+            "subscription_billing_cost_usd": None,
+        }
+        with self._lock:
+            key = (backend, request_id)
+            if request_id is not None and key in self._seen_requests:
+                return
+            if request_id is not None:
+                self._seen_requests.add(key)
+            self.normalized_usage.append(record)
 
     def add_interaction(
         self,
@@ -81,14 +119,15 @@ class TokenTracker:
         timestamp: datetime,
     ):
         """Record a single interaction with the model."""
-        self.interactions[model].append(
-            {
-                "system_message": system_message,
-                "prompt": prompt,
-                "response": response,
-                "timestamp": timestamp,
-            }
-        )
+        with self._lock:
+            self.interactions[model].append(
+                {
+                    "system_message": system_message,
+                    "prompt": prompt,
+                    "response": response,
+                    "timestamp": timestamp,
+                }
+            )
 
     def get_interactions(self, model: Optional[str] = None) -> Dict[str, List[Dict]]:
         """Get all interactions, optionally filtered by model."""
@@ -102,13 +141,14 @@ class TokenTracker:
             lambda: {"prompt": 0, "completion": 0, "reasoning": 0, "cached": 0}
         )
         self.interactions = defaultdict(list)
-        # self._encoders = {}
+        self.normalized_usage = []
+        self._seen_requests = set()
 
-    def calculate_cost(self, model: str) -> float:
+    def calculate_cost(self, model: str) -> float | None:
         """Calculate the cost for a specific model based on token usage."""
         if model not in self.MODEL_PRICES:
             logging.warning(f"Price information not available for model {model}")
-            return 0.0
+            return None
 
         prices = self.MODEL_PRICES[model]
         tokens = self.token_counts[model]
@@ -128,11 +168,37 @@ class TokenTracker:
         # return dict(self.token_counts)
         """Get summary of token usage and costs for all models."""
         summary = {}
-        for model, tokens in self.token_counts.items():
+        with self._lock:
+            api_counts = {model: tokens.copy() for model, tokens in self.token_counts.items()}
+            normalized_usage = list(self.normalized_usage)
+        for model, tokens in api_counts.items():
             summary[model] = {
                 "tokens": tokens.copy(),
                 "cost (USD)": self.calculate_cost(model),
             }
+        # CLI costs are deliberately not passed through the historical API
+        # price table; an API-equivalent estimate is not a subscription bill.
+        for record in normalized_usage:
+            key = f"{record['backend']}:{record['model'] or 'default'}"
+            entry = summary.setdefault(key, {
+                "tokens": {"prompt": None, "completion": None, "reasoning": None, "cached": None},
+                "cost (USD)": None,
+                "subscription_billing_cost_usd": None,
+                "input_includes_cached": record["input_includes_cached"],
+                "cache_creation_input_tokens": None,
+                "requests": 0,
+                "usage_complete": True,
+            })
+            entry["requests"] += 1
+            if record["cache_creation_input_tokens"] is not None:
+                entry["cache_creation_input_tokens"] = (entry["cache_creation_input_tokens"] or 0) + record["cache_creation_input_tokens"]
+            for target, source in (("prompt", "input_tokens"), ("completion", "output_tokens"),
+                                   ("reasoning", "reasoning_tokens"), ("cached", "cached_input_tokens")):
+                value = record[source]
+                if value is not None:
+                    entry["tokens"][target] = (entry["tokens"][target] or 0) + value
+                elif target in ("prompt", "completion"):
+                    entry["usage_complete"] = False
         return summary
 
 
@@ -140,83 +206,53 @@ class TokenTracker:
 token_tracker = TokenTracker()
 
 
+def _field(value, name, default=None):
+    return value.get(name, default) if isinstance(value, dict) else getattr(value, name, default)
+
+
+def record_token_usage(result, *, prompt=None, system_message=None):
+    """Record a raw API SDK response; facade tuples never masquerade as SDK data."""
+    usage = _field(result, "usage")
+    model = _field(result, "model")
+    if usage is None or model is None:
+        return
+    prompt_count = _field(usage, "prompt_tokens", _field(usage, "input_tokens"))
+    completion_count = _field(usage, "completion_tokens", _field(usage, "output_tokens"))
+    if prompt_count is None or completion_count is None:
+        return
+    reasoning = _field(_field(usage, "completion_tokens_details"), "reasoning_tokens", 0) or 0
+    cached = _field(_field(usage, "prompt_tokens_details"), "cached_tokens", 0) or 0
+    token_tracker.add_tokens(model, prompt_count, completion_count, reasoning, cached)
+    choices = _field(result, "choices")
+    if choices:
+        response = _field(_field(choices[0], "message"), "content")
+    else:
+        content = _field(result, "content", [])
+        response = "\n".join(_field(part, "text", "") for part in content)
+    token_tracker.add_interaction(
+        model, system_message, prompt, response,
+        _field(result, "created", datetime.now()),
+    )
+
+
 def track_token_usage(func):
+    """Transparent for positional arguments, absent SDK detail fields and tuples."""
+    signature = inspect.signature(func)
+
+    def record(result, args, kwargs):
+        bound = signature.bind_partial(*args, **kwargs).arguments
+        record_token_usage(result, prompt=bound.get("prompt"), system_message=bound.get("system_message"))
+
     @wraps(func)
     async def async_wrapper(*args, **kwargs):
-        prompt = kwargs.get("prompt")
-        system_message = kwargs.get("system_message")
-        if not prompt and not system_message:
-            raise ValueError(
-                "Either 'prompt' or 'system_message' must be provided for token tracking"
-            )
-
-        logging.info("args: ", args)
-        logging.info("kwargs: ", kwargs)
-
         result = await func(*args, **kwargs)
-        model = result.model
-        timestamp = result.created
-
-        if hasattr(result, "usage") and result.usage.completion_tokens_details is not None:
-            token_tracker.add_tokens(
-                model,
-                result.usage.prompt_tokens,
-                result.usage.completion_tokens,
-                result.usage.completion_tokens_details.reasoning_tokens,
-                (
-                    result.usage.prompt_tokens_details.cached_tokens
-                    if hasattr(result.usage, "prompt_tokens_details")
-                    else 0
-                ),
-            )
-            # Add interaction details
-            token_tracker.add_interaction(
-                model,
-                system_message,
-                prompt,
-                result.choices[
-                    0
-                ].message.content,  # Assumes response is in content field
-                timestamp,
-            )
+        record(result, args, kwargs)
         return result
 
     @wraps(func)
     def sync_wrapper(*args, **kwargs):
-        prompt = kwargs.get("prompt")
-        system_message = kwargs.get("system_message")
-        if not prompt and not system_message:
-            raise ValueError(
-                "Either 'prompt' or 'system_message' must be provided for token tracking"
-            )
         result = func(*args, **kwargs)
-        model = result.model
-        timestamp = result.created
-        logging.info("args: ", args)
-        logging.info("kwargs: ", kwargs)
-
-        if hasattr(result, "usage") and result.usage.completion_tokens_details is not None:
-            token_tracker.add_tokens(
-                model,
-                result.usage.prompt_tokens,
-                result.usage.completion_tokens,
-                result.usage.completion_tokens_details.reasoning_tokens,
-                (
-                    result.usage.prompt_tokens_details.cached_tokens
-                    if hasattr(result.usage, "prompt_tokens_details")
-                    else 0
-                ),
-            )
-            # Add interaction details
-            token_tracker.add_interaction(
-                model,
-                system_message,
-                prompt,
-                result.choices[
-                    0
-                ].message.content,  # Assumes response is in content field
-                timestamp,
-            )
+        record(result, args, kwargs)
         return result
 
     return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
