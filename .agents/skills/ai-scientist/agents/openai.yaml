@@ -1,0 +1,3 @@
+interface:
+  display_name: "AI Scientist"
+  short_description: "Run V2 research through subscription Codex or Claude CLI"

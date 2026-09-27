@@ -88,7 +88,11 @@ def subscription_environment(backend: str, source: dict | None = None) -> dict:
     for key in list(env):
         if key not in protected and key.startswith(prefixes):
             del env[key]
-    for key in ("NODE_OPTIONS", "NODE_PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"):
+    # A skill can run V2 from an interactive Claude session. Its isolated,
+    # stateless, tool-free child must not inherit the parent's session marker.
+    # CLAUDE_CODE_* session variables are already removed by the prefix rule.
+    # Do not change the parent environment, auth storage, or isolation flags.
+    for key in ("CLAUDECODE", "NODE_OPTIONS", "NODE_PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"):
         env.pop(key, None)
     env["NO_COLOR"] = "1"
     if backend == "claude_cli":
@@ -600,6 +604,13 @@ def _codex_command(executable: str, request: InferenceRequest, directory: Path,
     }
     for key, value in settings.items():
         argv += ["-c", key + "=" + json.dumps(value, ensure_ascii=False)]
+    # Request artifacts can live below this repository, where Codex discovers
+    # ancestor .agents/skills independently of project_doc_max_bytes. Keep the
+    # operator skill out of inference children without disabling it for users.
+    # Codex 0.157.1 expects the SKILL.md file (not its directory) here. Inline
+    # tables use TOML '=' syntax; JSON objects are not a valid -c array value.
+    operator_skill = Path(__file__).resolve().parents[2] / ".agents/skills/ai-scientist/SKILL.md"
+    argv += ["-c", "skills.config=[{path=" + json.dumps(str(operator_skill), ensure_ascii=False) + ",enabled=false}]"]
     for feature in _CODEX_DISABLED_FEATURES:
         argv += ["--disable", feature]
     argv += ["--output-last-message", str(directory / "final.txt")]

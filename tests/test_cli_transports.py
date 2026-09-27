@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 
 import pytest
 
@@ -85,6 +86,20 @@ def test_schema_false_evaluation_is_preserved(fake_provider, tmp_path):
     result = execute(make_request(backend, schema=schema), provider, tmp_path / "request")
     assert result.structured_data == {"valid": False, "analyses": []}
     assert json.loads(result.text) == result.structured_data
+
+
+def test_operator_skill_is_disabled_only_for_codex_inference_child(tmp_path):
+    from ai_scientist.inference.cli import _codex_command
+
+    command = _codex_command("codex", make_request("codex_cli"), tmp_path,
+                             tmp_path / "system.txt", [])
+    overrides = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "-c"]
+    settings = tomllib.loads("\n".join(overrides))
+    skill = Path(__file__).resolve().parents[1] / ".agents/skills/ai-scientist/SKILL.md"
+    assert settings["skills"]["config"] == [{"path": str(skill), "enabled": False}]
+    assert skill.is_file()
+    assert settings["project_doc_max_bytes"] == 0
+    assert command[command.index("--sandbox") + 1] == "read-only"
 
 
 def test_default_model_omitted_and_explicit_model_is_one_argument(fake_provider, tmp_path):
@@ -196,6 +211,8 @@ def test_child_api_env_removed_without_parent_or_home_changes(fake_provider, tmp
         "ANTHROPIC_BASE_URL": "https://invalid.example", "CODEX_HOME": "/auth-home-unchanged",
         "CLAUDE_CONFIG_DIR": "/claude-home-unchanged",
         "AI_SCIENTIST_INFERENCE_RUNTIME": "PRIVATE_LOCAL_BROKER_TOKEN",
+        "CLAUDECODE": "1", "CLAUDE_CODE_ENTRYPOINT": "cli",
+        "CLAUDE_CODE_SESSION_ID": "parent-session", "CODEX_THREAD_ID": "parent-thread",
     }
     for key, value in variables.items():
         monkeypatch.setenv(key, value)

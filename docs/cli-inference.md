@@ -23,6 +23,56 @@ V2のPython側が研究工程を制御し、本文・コード生成、実験指
 
 Codexは `codex login`、Claudeは `claude auth login` を利用します。Claudeの `--console`、APIキー認証、Bedrock/VertexはこのCLI profileでは拒否します。認証方式の違いは [Codex公式認証](https://developers.openai.com/codex/auth/)・[Claude公式CLI](https://code.claude.com/docs/en/cli-reference) を参照してください。追加usage購入などの契約設定はアカウント側で管理してください。アプリから追加課金を承認・購入する処理はありませんが、アカウントに既に設定された追加usageをゼロと保証できません。
 
+## Codex／Claude CLIのSkill
+
+このcheckoutを作業ディレクトリにしてCLIを開き、Codexでは
+`$ai-scientist Codexで環境診断して`、Claude Codeでは
+`/ai-scientist Claudeで研究を準備して` と依頼できます。
+`.agents/skills/ai-scientist`を共通の本体とし、`.claude/skills/ai-scientist`
+から相対symlinkで参照します。Git clone時にsymlinkを保持してください。
+既存セッションで表示されない場合は、このcheckoutでセッションを開き直します。
+ホームディレクトリのSkill登録、認証、設定ファイルは変更しません。
+
+このSkillは診断・テーマ準備・アイデア生成・研究起動・保存結果確認の入口です。
+V2の研究制御、4段階の実験、執筆・査読、成果物保存はPython本体が引き続き担当します。
+親として操作するCLIと、推論に使うCLIは別に選べます。
+
+共通helperは `python .agents/skills/ai-scientist/scripts/operate.py` です。
+`doctor` / `ideate` / `run`には `--provider codex|claude|mixed` または
+CLI専用の `--inference-config PATH` が必要で、API profileやsubscription-onlyの
+無効化を拒否します。`status`にはproviderもモデル依存も不要です。
+
+- `doctor --provider codex`: CLIの非推論チェック。`--dry-run`なら計画だけを表示。
+- `ideate --provider codex --workshop-file PATH`: アイデア生成の計画だけを表示。
+- `run --provider claude --ideas PATH --idea-index 0`: 研究の計画だけを表示。
+- `doctor --provider codex --probe`: 小規模実推論の計画・要求件数だけを表示。
+- 上記のlive操作は、利用者が対象・範囲を了承してから同じ引数に `--execute` を追加。
+- `status [--run-dir PATH]`: 保存済みの研究状態を読む。プロセス生存確認や自動再開ではない。
+
+研究の計画には実験worker数、段階ごとの反復数、seed数、実験の実行期限と、
+それらとは別の推論並列上限・要求期限・retry回数を表示します。
+通常は全工程を保持します。明示的な `--skip-writeup` は既存本体と同様に引用・執筆・査読を
+まとめて省略し、`--skip-review` は査読のみを省略します。
+profileや研究設定を編集した場合は、実行前に再度計画を確認してください。
+
+helperは現在のPython interpreterを使うので、研究用venvを有効にするか、そのPythonの
+絶対パスを指定してください。入力の相対パスは呼出し元を基準に解決し、本体のcwdは
+checkoutへ固定します。Skillを別の場所へコピーした場合は、subcommandより前に
+`--project-root PATH`を指定します。研究用依存やM3の計算能力をSkillが代替するものではありません。
+
+長時間処理はpoll／interrupt可能な実行セッションで監視します。helper自身は `exec` で
+本体へ置き換わり、余分な親プロセスや独自のバックグラウンド化を加えません。
+対話セッション終了後の継続、総利用枠の上限、任意地点からのresumeは保証しません。
+Claude親セッションの `CLAUDECODE` 等は隔離された推論子プロセスでのみ除去し、
+親の認証や環境変数、既存のtools/config隔離は変更しません。
+成果物ディレクトリがcheckout内でも操作Skillが推論へ混入しないよう、Codexの子コマンド
+だけに `skills.config` の無効化指定を加えます。Claudeは既存のsafe modeがSkill読込を
+無効化します。外側の対話セッションでは通常どおりSkillを利用できます。
+
+既存idea archiveの再利用、quota停止後の新規実行、詳細な引数は
+[Skillの運用手順](../.agents/skills/ai-scientist/references/operations.md)を参照してください。
+通常のdoctorが成功しても、PyTorch・PDF/LaTeXを含む研究全工程の動作保証ではありません。
+
 ## 起動
 
 プロジェクトのルートで実行します。

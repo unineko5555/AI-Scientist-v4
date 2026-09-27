@@ -20,6 +20,10 @@ if log:
     with open(log, "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"args": args, "cwd": os.getcwd()}) + "\n")
 
+if backend == "claude" and os.environ.get("CLAUDECODE"):
+    print("Parent Claude session marker leaked into isolated child", file=sys.stderr)
+    sys.exit(2)
+
 if "--version" in args:
     default = "2.1.259 (Claude Code)" if backend == "claude" else "codex-cli 0.157.1"
     print(os.environ.get("FAKE_CLI_VERSION", default))

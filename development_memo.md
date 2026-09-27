@@ -902,3 +902,82 @@ doctorの結果は`probes_passed`、`live_requests_attempted: 3`、`all_three_ch
 ### 18.5 Mac M3での利用方針
 
 利用者のMacはApple M3・メモリ16GB・macOS 15.1で、LaTeXは導入済み、project venvのPyTorchは未導入である。GPU未検出時のCPU経路と生成コードへのCUDA/CPU切替指示が既にあるため、M3でCPU実行するためだけの追加改修は不要と確認した。利用者の意向に合わせ、MPS対応や並列数変更は追加していない。今後は研究用依存の導入と既存CPU経路での小規模な全工程検証が必要であり、CLIの動作確認だけから研究実験の成功・性能を保証しない。
+
+## 19. Codex／Claude Code共通Skill（2026-09-27）
+
+### 19.1 目的と配置
+
+利用者の依頼により、V2の研究本体を維持した操作用の`ai-scientist` Skillを追加した。
+研究工程や状態管理をプロンプトへ再実装せず、既存のdoctor・ideation・launcherを呼び出す。
+配置は[Codexの公式Skill仕様](https://learn.chatgpt.com/docs/build-skills)と
+[Claude Codeの公式Skill仕様](https://code.claude.com/docs/en/skills)に従う。
+
+- `.agents/skills/ai-scientist/SKILL.md`: 共通の利用条件・診断／準備／実行／結果確認手順。
+- 同ディレクトリの`references/operations.md`: 引数、依存、成果物、停止後の新規実行手順。
+- 同ディレクトリの`scripts/operate.py`: CLI-only設定検証と既存entrypointへの薄い引数変換。
+- 同ディレクトリの`agents/openai.yaml`: Codex向け表示名・短い説明。自動選択は既定のまま。
+- `.claude/skills/ai-scientist`: 共通ディレクトリへの相対symlink。コピーの二重管理を避ける。
+
+このcheckoutでCLIを起動すればCodexの`$ai-scientist`、Claudeの`/ai-scientist`から
+利用できる構成であり、ホームディレクトリの設定・Skill一覧や認証は変更しない。
+配布用plugin、MCP server、デーモンや新たなAPI接続は追加していない。
+
+### 19.2 実行境界
+
+`doctor` / `ideate` / `run`には`--provider codex|claude|mixed`または明示profileが必要。
+既存の`InferenceConfig`で検証した上で、`mode: cli`・`subscription_only: true`を必須にする。
+CLI/API混在、API profile、API fallback、任意の追加CLI引数、オプション名の省略を拒否する。
+外側で操作するCLIから推論providerを推測せず、未選択なら利用者へ確認する。
+
+アイデア生成・研究・live probeは`--execute`なしでは計画表示だけであり、モデル要求、
+研究実行、成果物生成を開始しない。通常のdoctorは非推論チェックを行い、
+`--dry-run`ならそれも実行しない。probe計画にはdistinct backend/modelごとの要求件数を表示する。
+計画には全role、実験worker数、4段階の反復上限、seed数、実験実行期限、別管理の推論並列数・
+要求／queue期限・retry設定を含める。全工程が既定で、明示的な省略だけを既存本体へ渡す。
+`--skip-writeup`が引用・査読も省略するという既存動作も計画へ反映する。
+
+ユーザー指定の入力相対パスは呼出し元を基準に絶対化し、本体はcheckout rootをcwdとして
+現在のPython interpreterで起動する。shellによる文字列評価は行わない。
+`exec`で本体へ置き換えるため余分な監視プロセスを作らず、終了コード・SIGINT・
+既存の所有プロセス回収処理を維持する。古いbroker接続環境は新規起動へ引き継がない。
+バックグラウンド常駐、セッション終了後の継続、総usage予算の強制、任意地点resumeは追加しない。
+
+既存idea JSONの書換えは明示的な`--allow-existing-ideas`が必要で、入力と出力の同一ファイルや
+symlink経由の出力を拒否する。通常のideation推論ログはtopicの隣ではなく既存の`.inference/`へ保存する。
+`status`は標準ライブラリだけで研究の`run_status.json`を読む。推論manifestの完了から研究成功を
+推定せず、保存されたrunningが現在の生存を保証しないことを明示する。
+
+### 19.3 親CLIと推論子CLIの分離
+
+親Claude Codeが設定する`CLAUDECODE`を推論子プロセスの環境コピーから除去した。
+`CLAUDE_CODE_*`と`CODEX_*`の親セッション情報は既存prefix除去の対象である。
+親の環境、認証保存先、safe mode、tools/MCPの無効化、権限は変更しない。
+
+Codexは成果物のcwdから上位の`.agents/skills`を検出できるため、
+`project_doc_max_bytes: 0`だけで新規Skillが除外されるとは扱わない。
+子コマンドにこのcheckoutの操作用`SKILL.md`を無効化する`skills.config`を追加した。
+実機0.157.1のread-only `skills/list`では、ディレクトリ指定だけでは無効化されず、
+`SKILL.md`ファイル指定で`enabled: false`となることを確認した。引数はTOML inline tableとして
+構築し、親の設定ファイルを書き換えない。Claudeは既存のsafe modeがSkillの読込を抑止する。
+
+### 19.4 検証と未検証範囲
+
+新規のオフライン試験では、両ホストの配置・共通参照、API拒否、計画の非実行性、
+実行の明示性、既存JSON保護、相対／特殊文字パス、実験／推論制限、実際の省略工程、
+statusの失敗時処理を確認した。Hypothesisでmodel・path引数のroundtripとCLI-only不変条件を検証し、
+stub launcherを実processとして実行してPID・終了コードの保持とSIGINT時のcleanupも確認した。
+独立したSkill利用評価で得た期限表示・実際の省略工程・保存ideaからの新規実行手順の指摘は修正し、
+再評価でも解消を確認した。
+
+最終版のproject venv全回帰suiteは**518 passed / 23 skipped**（62.39秒）。
+分離venvでは全suiteが隔離指定の最終追加前に517 passed / 23 skipped、最終追加後の
+変更対象2suiteが**164 passed / 23 skipped**（26.02秒）で成功した。
+23 skippedは既存のprovider別parameterizationによるもの。既存fork試験の警告4件と
+project環境のpyparsing由来警告1件は残る。両配置のSkill validator、Python構文検査、
+`git diff --check`も成功した。
+
+Codex実機の非推論`skills/list`で、通常はrepo scopeの`ai-scientist`が`enabled: true`、
+子CLI用overrideでは`enabled: false`となることを確認した。両CLIのhelper経由doctorも、
+親セッション環境変数を与えた状態で`ready_read_only`・`live_requests_attempted: 0`で成功した。
+ClaudeのSkill配置／symlinkとhelperは検証したが、Claudeの対話UIから実モデルでSkillを発火させる
+試験や、新たな実推論・研究全工程試験は行っていない。18.4の受入条件は引き続き残る。
